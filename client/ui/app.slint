@@ -576,7 +576,7 @@ export component AppWindow inherits Window {
             Rectangle {
                 horizontal-stretch: 1;
                 border-radius: 8px;
-                background: root.update-available && ver-ta.has-hover ? T.raised : transparent;
+                background: ver-ta.has-hover ? T.raised : transparent;
                 HorizontalLayout {
                     padding-left: 4px;
                     padding-right: 8px;
@@ -590,8 +590,9 @@ export component AppWindow inherits Window {
                     }
                 }
                 ver-ta := TouchArea {
-                    enabled: root.update-available && !root.update-busy;
-                    mouse-cursor: root.update-available ? pointer : default;
+                    // Есть обновление — нажатие ставит его; нет — проверяет, не появилось ли.
+                    enabled: !root.update-busy;
+                    mouse-cursor: pointer;
                     clicked => {
                         root.update-clicked();
                     }

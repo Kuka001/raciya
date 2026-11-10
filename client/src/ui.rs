@@ -308,6 +308,40 @@ fn spawn_update_checker() {
     });
 }
 
+/// Нажатие на строку версии: если обновление уже найдено — ставим его, иначе проверяем сейчас.
+fn version_clicked() {
+    let mut known = false;
+    with_ui(|ui| known = ui.release.is_some());
+    if known {
+        start_update();
+        return;
+    }
+    with_ui(|ui| {
+        ui.win.set_update_busy(true);
+        ui.win.set_version_text("Проверяю обновления…".into());
+    });
+    std::thread::spawn(|| {
+        let result = update::latest();
+        post(move |ui| {
+            ui.win.set_update_busy(false);
+            match result {
+                Ok(Some(rel)) if update::is_newer(&rel.version, update::CURRENT) => {
+                    ui.win.set_version_text(version_line(Some(&rel)).into());
+                    ui.win.set_update_available(true);
+                    ui.release = Some(rel);
+                }
+                Ok(_) => {
+                    ui.win.set_version_text(format!("Версия: {} — новых версий нет", update::CURRENT).into());
+                }
+                Err(e) => {
+                    ui.win.set_version_text(version_line(None).into());
+                    ui.show_notice(format!("не удалось проверить обновления: {e}"));
+                }
+            }
+        });
+    });
+}
+
 fn start_update() {
     let mut rel = None;
     with_ui(|ui| {
@@ -825,7 +859,7 @@ pub fn run(args: &[String]) {
         with_ui(|ui| ui.win.set_vad_threshold(v));
     });
     window.on_page_changed(|_| with_ui(|ui| ui.update_level_timer()));
-    window.on_update_clicked(start_update);
+    window.on_update_clicked(version_clicked);
     window.on_rerun_diag(|| {
         with_ui(|ui| ui.win.set_diag_running(true));
         request_diag();

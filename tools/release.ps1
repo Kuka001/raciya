@@ -18,13 +18,20 @@ $version = (Select-String -Path "$root\client\Cargo.toml" -Pattern '^version\s*=
 $tag = "v$version"
 "version: $version"
 
+# Запускает программу командной строки. Её сообщения в stderr (git и cargo пишут туда обычный ход работы)
+# не считаются ошибкой; ошибка — только ненулевой код завершения.
+function Run([string]$CommandLine) {
+    cmd /c "$CommandLine 2>&1" | ForEach-Object { "$_" }
+    if ($LASTEXITCODE -ne 0) { throw "command failed ($LASTEXITCODE): $CommandLine" }
+}
+
 if (-not $SkipBuild) {
     Push-Location "$root\client"
-    cargo test
-    if ($LASTEXITCODE -ne 0) { Pop-Location; throw 'tests failed' }
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) { Pop-Location; throw 'build failed' }
-    Pop-Location
+    try {
+        Run 'cargo test'
+        Run 'cargo build --release'
+    }
+    finally { Pop-Location }
 }
 New-Item -ItemType Directory -Force "$root\dist" | Out-Null
 $asset = "$root\dist\Raciya-Setup.exe"
@@ -34,11 +41,13 @@ $built = (Get-Item $asset).VersionInfo.FileVersion
 if ($built -notlike "$version*") { throw "the built file is version $built, expected $version - rebuild without -SkipBuild" }
 
 Push-Location $root
-if (git status --porcelain) { Pop-Location; throw 'there are uncommitted changes - commit them first' }
-if (-not (git tag --list $tag)) { git tag $tag }
-git push origin HEAD
-git push origin $tag
-Pop-Location
+try {
+    if (cmd /c 'git status --porcelain 2>nul') { throw 'there are uncommitted changes - commit them first' }
+    if (-not (cmd /c "git tag --list $tag 2>nul")) { Run "git tag $tag" }
+    Run 'git push origin HEAD'
+    Run "git push origin $tag"
+}
+finally { Pop-Location }
 
 # Токен из сохранённых данных Git; на экран не выводится.
 # Запрос передаётся через файл: PowerShell при передаче по конвейеру меняет переводы строк,

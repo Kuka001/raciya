@@ -1,0 +1,1275 @@
+import { ComboBox, LineEdit } from "std-widgets.slint";
+
+export struct UserItem {
+    session: int,
+    name: string,
+    initial: string,
+    muted: bool,
+    deafened: bool,
+    speaking: bool,
+    volume: float,
+    is-self: bool,
+}
+
+global T {
+    out property <color> bg: #0f1012;
+    out property <color> panel: #151619;
+    out property <color> raised: #1c1e22;
+    out property <color> chip: #26282c;
+    out property <color> line: #222428;
+    out property <color> line2: #2a2c31;
+    out property <color> text: #ecedee;
+    out property <color> muted: #a3a7af;
+    out property <color> faint: #8b8f98;
+    out property <color> speak: #4cc38a;
+    out property <color> warn: #e2a03f;
+    out property <color> danger: #e5686c;
+    out property <color> knob: #c9ccd1;
+}
+
+global Icons {
+    out property <string> mic: "M 12 3 A 3 3 0 0 0 9 6 L 9 12 A 3 3 0 0 0 15 12 L 15 6 A 3 3 0 0 0 12 3 Z M 5 11 A 7 7 0 0 0 19 11 M 12 18 L 12 21";
+    out property <string> mic-off: "M 12 3 A 3 3 0 0 0 9 6 L 9 12 A 3 3 0 0 0 15 12 L 15 6 A 3 3 0 0 0 12 3 Z M 5 11 A 7 7 0 0 0 19 11 M 12 18 L 12 21 M 4 4 L 20 20";
+    out property <string> phones: "M 4 14 L 4 12 A 8 8 0 0 1 20 12 L 20 14 M 4 14 L 7 14 L 7 20 L 5 20 A 1 1 0 0 1 4 19 Z M 20 14 L 17 14 L 17 20 L 19 20 A 1 1 0 0 0 20 19 Z";
+    out property <string> phones-off: "M 4 14 L 4 12 A 8 8 0 0 1 20 12 L 20 14 M 4 14 L 7 14 L 7 20 L 5 20 A 1 1 0 0 1 4 19 Z M 20 14 L 17 14 L 17 20 L 19 20 A 1 1 0 0 0 20 19 Z M 4 4 L 20 20";
+    out property <string> wave: "M 5 10 L 5 14 M 9.5 7 L 9.5 17 M 14 4 L 14 20 M 18.5 8 L 18.5 16";
+    out property <string> pulse: "M 3 12 L 6 12 L 9 5 L 13 19 L 16 12 L 21 12";
+    out property <string> back: "M 15 5 L 8 12 L 15 19";
+    out property <string> sliders: "M 4 6 L 13 6 M 19 6 L 20 6 M 4 12 L 7 12 M 13 12 L 20 12 M 4 18 L 15 18 M 21 18 L 20 18 M 18.5 6 A 2.5 2.5 0 1 1 13.5 6 A 2.5 2.5 0 1 1 18.5 6 M 12.5 12 A 2.5 2.5 0 1 1 7.5 12 A 2.5 2.5 0 1 1 12.5 12 M 20.5 18 A 2.5 2.5 0 1 1 15.5 18 A 2.5 2.5 0 1 1 20.5 18";
+}
+
+component Icon inherits Path {
+    in property <string> d;
+    in property <brush> color: T.text;
+    in property <length> size: 20px;
+    width: root.size;
+    height: root.size;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    commands: root.d;
+    stroke: root.color;
+    stroke-width: 1.6px;
+    fill: transparent;
+}
+
+component Card inherits Rectangle {
+    background: T.panel;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: T.line;
+}
+
+component Caption inherits Text {
+    color: T.muted;
+    font-size: 12px;
+    vertical-alignment: center;
+}
+
+// Ползунок: значение хранит модель, компонент только сообщает о перемещении.
+component VolSlider inherits Rectangle {
+    in property <float> value: 1.0;
+    in property <float> maximum: 2.0;
+    in property <bool> enabled: true;
+    callback changed(float);
+    height: 28px;
+    min-width: 60px;
+    property <length> knob-size: 12px;
+    property <float> frac: max(0, min(1, root.value / root.maximum));
+
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: 3px;
+        border-radius: 1.5px;
+        background: T.line2;
+    }
+
+    Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: knob.x + root.knob-size / 2;
+        height: 3px;
+        border-radius: 1.5px;
+        background: root.enabled ? T.knob : T.faint;
+    }
+
+    knob := Rectangle {
+        x: (parent.width - root.knob-size) * root.frac;
+        y: (parent.height - self.height) / 2;
+        width: root.knob-size;
+        height: root.knob-size;
+        border-radius: root.knob-size / 2;
+        background: ta.pressed || ta.has-hover ? T.text : T.knob;
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        function pick() {
+            root.changed(max(0, min(root.maximum, (self.mouse-x - root.knob-size / 2) / (root.width - root.knob-size) * root.maximum)));
+        }
+        moved => {
+            if (self.pressed) {
+                self.pick();
+            }
+        }
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                self.pick();
+            }
+        }
+    }
+}
+
+component Toggle inherits Rectangle {
+    in property <bool> checked;
+    callback toggled(bool);
+    width: 40px;
+    height: 22px;
+    border-radius: 11px;
+    background: root.checked ? T.knob : T.chip;
+    animate background { duration: 120ms; }
+    Rectangle {
+        x: root.checked ? parent.width - self.width - 3px : 3px;
+        y: 3px;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: root.checked ? T.bg : T.muted;
+        animate x { duration: 120ms; easing: ease-out; }
+    }
+    TouchArea {
+        clicked => {
+            root.toggled(!root.checked);
+        }
+    }
+}
+
+component PlainButton inherits Rectangle {
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> primary;
+    in property <bool> active;
+    in property <bool> enabled: true;
+    in property <brush> accent: T.text;
+    callback clicked();
+    height: 44px;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: root.active ? root.accent : (root.primary ? transparent : T.line2);
+    background: root.primary ? (ta.has-hover ? #ffffff : T.text) : (ta.pressed ? T.chip : ta.has-hover ? T.raised : T.panel);
+    opacity: root.enabled ? 1 : 0.45;
+    animate background { duration: 100ms; }
+    HorizontalLayout {
+        alignment: center;
+        spacing: 8px;
+        padding-left: 12px;
+        padding-right: 12px;
+        if root.icon != "": VerticalLayout {
+            alignment: center;
+            Icon {
+                d: root.icon;
+                size: 16px;
+                color: root.primary ? T.bg : (root.active ? root.accent : T.text);
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.primary ? T.bg : (root.active ? root.accent : T.text);
+            font-size: 12px;
+            font-weight: root.primary || root.active ? 600 : 500;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Крупная кнопка «Микрофон» / «Звук».
+component BigButton inherits Rectangle {
+    in property <string> label;
+    in property <string> icon-on;
+    in property <string> icon-off;
+    in property <bool> off;
+    callback clicked();
+    height: 76px;
+    // Обе кнопки одинаковой ширины независимо от длины подписи.
+    preferred-width: 0px;
+    horizontal-stretch: 1;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: root.off ? #4a3a22 : T.line;
+    background: root.off ? #211b12 : (ta.pressed ? T.chip : ta.has-hover ? T.raised : T.panel);
+    animate background { duration: 100ms; }
+    VerticalLayout {
+        alignment: center;
+        spacing: 8px;
+        HorizontalLayout {
+            alignment: center;
+            Icon {
+                d: root.off ? root.icon-off : root.icon-on;
+                size: 22px;
+                color: root.off ? T.warn : T.text;
+            }
+        }
+        Text {
+            text: root.label;
+            color: root.off ? T.warn : T.text;
+            font-size: 12px;
+            font-weight: 500;
+            horizontal-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component Segment inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked();
+    height: 40px;
+    border-radius: 8px;
+    background: root.selected ? T.chip : (ta.has-hover ? T.raised : transparent);
+    animate background { duration: 100ms; }
+    Text {
+        text: root.text;
+        color: root.selected ? T.text : T.muted;
+        font-size: 12px;
+        font-weight: root.selected ? 600 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component UserRow inherits Rectangle {
+    in property <UserItem> user;
+    callback volume-changed(float);
+    height: 46px;
+    border-radius: 10px;
+    background: root.user.speaking ? T.raised : transparent;
+    animate background { duration: 120ms; }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 16px;
+                border-width: 1.5px;
+                border-color: root.user.speaking ? T.speak : transparent;
+                animate border-color { duration: 120ms; }
+                Rectangle {
+                    x: 3px;
+                    y: 3px;
+                    width: 26px;
+                    height: 26px;
+                    border-radius: 13px;
+                    background: T.chip;
+                    Text {
+                        text: root.user.initial;
+                        color: root.user.muted || root.user.deafened ? T.muted : T.text;
+                        font-size: 12px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        Text {
+            text: root.user.name;
+            color: root.user.muted || root.user.deafened ? T.muted : T.text;
+            font-size: 14px;
+            font-weight: root.user.speaking ? 600 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if root.user.speaking: VerticalLayout {
+            alignment: center;
+            Icon {
+                d: Icons.wave;
+                size: 16px;
+                color: T.speak;
+            }
+        }
+        if root.user.deafened: VerticalLayout {
+            alignment: center;
+            Icon {
+                d: Icons.phones-off;
+                size: 16px;
+                color: T.warn;
+            }
+        }
+        if root.user.muted && !root.user.deafened: VerticalLayout {
+            alignment: center;
+            Icon {
+                d: Icons.mic-off;
+                size: 16px;
+                color: T.warn;
+            }
+        }
+        if !root.user.is-self: VerticalLayout {
+            alignment: center;
+            VolSlider {
+                width: 104px;
+                value: root.user.volume;
+                changed(v) => {
+                    root.volume-changed(v);
+                }
+            }
+        }
+        if root.user.is-self: Text {
+            width: 104px;
+            text: "это вы";
+            color: T.faint;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component Field inherits VerticalLayout {
+    in property <string> label;
+    spacing: 6px;
+    Caption {
+        text: root.label;
+    }
+    @children
+}
+
+component SettingRow inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> hint;
+    in property <bool> checked;
+    callback toggled(bool);
+    spacing: 12px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 2px;
+        alignment: center;
+        Text {
+            text: root.title;
+            color: T.text;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+        if root.hint != "": Text {
+            text: root.hint;
+            color: T.faint;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+    VerticalLayout {
+        alignment: center;
+        Toggle {
+            checked: root.checked;
+            toggled(v) => {
+                root.toggled(v);
+            }
+        }
+    }
+}
+
+export struct IssueItem {
+    title: string,
+    advice: string,
+    // 2 — мешает связи, 1 — может мешать
+    severity: int,
+    // 0 — исправить можно только вручную, иначе есть кнопка «Исправить»
+    fix: int,
+}
+
+component IssueCard inherits Rectangle {
+    in property <IssueItem> issue;
+    callback fix-clicked();
+    background: T.panel;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: T.line;
+    HorizontalLayout {
+        padding: 14px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: start;
+            padding-top: 5px;
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: root.issue.severity >= 2 ? T.danger : T.warn;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 4px;
+            Text {
+                text: root.issue.title;
+                color: T.text;
+                font-size: 13px;
+                font-weight: 600;
+                wrap: word-wrap;
+            }
+            Text {
+                text: root.issue.advice;
+                color: T.muted;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+        if root.issue.fix != 0: VerticalLayout {
+            alignment: center;
+            PlainButton {
+                width: 100px;
+                height: 36px;
+                text: "Исправить";
+                clicked => {
+                    root.fix-clicked();
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Рация";
+    preferred-width: 640px;
+    preferred-height: 640px;
+    min-width: 580px;
+    min-height: 600px;
+    background: T.bg;
+    default-font-family: "Segoe UI";
+    default-font-size: 13px;
+
+    // 0 — нет связи, 1 — подключение, 2 — на связи, 3 — ошибка
+    in property <int> status-kind;
+    in property <string> status-text: "Нет связи";
+    in property <string> status-detail;
+    in property <string> ping-text;
+    in property <[UserItem]> users;
+    in property <bool> muted;
+    in property <bool> deafened;
+    in property <bool> vad-mode;
+    in property <string> key-name: "Mouse 4";
+    in property <bool> capturing-key;
+    in property <bool> mic-test;
+    in property <[string]> in-devices;
+    in property <[string]> out-devices;
+    in-out property <int> in-index;
+    in-out property <int> out-index;
+    // 0 — главный экран, 1 — подключение и настройки, 2 — проверка сети, 3 — установка
+    in-out property <int> page;
+    in-out property <string> server;
+    in-out property <string> username;
+    in-out property <string> password;
+    in property <bool> autoconnect: true;
+    // 0 — выключено, 1 — лёгкое, 2 — сильное
+    in property <int> noise-mode;
+    in property <bool> start-minimized;
+    in property <bool> disable-warp: true;
+    in property <float> vad-threshold: 0.2;
+    in property <float> mic-level;
+    in property <string> notice;
+    in property <bool> wants-connection;
+
+    // версия и обновления
+    in property <string> version-text: "Версия: —";
+    in property <bool> update-available;
+    in property <bool> update-busy;
+
+    // проверка сети
+    in property <[IssueItem]> issues;
+    in property <string> diag-facts;
+    in property <bool> diag-running;
+    in property <bool> diag-done;
+
+    // системные настройки
+    in property <bool> autostart;
+    in property <bool> game-mode;
+    in property <bool> tweaks-applied;
+    in property <bool> system-busy;
+    in property <bool> server-available;
+    in property <bool> run-server;
+    in property <string> invite-code;
+
+    // установка
+    in-out property <string> install-invite;
+    in-out property <bool> install-autostart: true;
+    in property <bool> install-busy;
+    in property <bool> install-upgrade;
+    in property <string> install-status;
+    in property <string> app-version;
+
+    callback toggle-mute();
+    callback toggle-deafen();
+    callback set-vad-mode(bool);
+    callback capture-key();
+    callback toggle-mic-test();
+    callback volume-changed(int, float);
+    callback input-selected(int);
+    callback output-selected(int);
+    callback save-connection();
+    callback toggle-connection();
+    callback set-autoconnect(bool);
+    callback set-noise-mode(int);
+    callback set-start-minimized(bool);
+    callback set-disable-warp(bool);
+    callback threshold-changed(float);
+    callback page-changed(int);
+    callback update-clicked();
+    callback rerun-diag();
+    callback fix-issue(int);
+    callback set-autostart(bool);
+    callback set-game-mode(bool);
+    callback apply-tweaks();
+    callback set-run-server(bool);
+    callback copy-invite();
+    callback install-clicked();
+
+    function go(p: int) {
+        root.page = p;
+        root.page-changed(p);
+    }
+
+    VerticalLayout {
+        padding: 12px;
+        padding-top: 8px;
+        spacing: 10px;
+
+        // --- строка 1: версия и кнопка настроек ---
+        if root.page != 3: HorizontalLayout {
+            height: 32px;
+            spacing: 10px;
+            if root.page != 0: Rectangle {
+                width: 32px;
+                border-radius: 8px;
+                background: back-ta.has-hover ? T.raised : transparent;
+                Icon {
+                    d: Icons.back;
+                    size: 16px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+                back-ta := TouchArea {
+                    clicked => {
+                        root.go(0);
+                    }
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                border-radius: 8px;
+                background: root.update-available && ver-ta.has-hover ? T.raised : transparent;
+                HorizontalLayout {
+                    padding-left: 4px;
+                    padding-right: 8px;
+                    Text {
+                        text: root.version-text;
+                        color: root.update-available ? T.speak : T.faint;
+                        font-size: 12px;
+                        font-weight: root.update-available ? 600 : 400;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                ver-ta := TouchArea {
+                    enabled: root.update-available && !root.update-busy;
+                    mouse-cursor: root.update-available ? pointer : default;
+                    clicked => {
+                        root.update-clicked();
+                    }
+                }
+            }
+            if root.page == 0: PlainButton {
+                height: 32px;
+                horizontal-stretch: 0;
+                border-radius: 10px;
+                icon: Icons.sliders;
+                text: "Подключение и настройки";
+                clicked => {
+                    root.go(1);
+                }
+            }
+        }
+
+        // --- строка 2: состояние связи и проверка сети ---
+        if root.page != 3: HorizontalLayout {
+            height: 30px;
+            spacing: 10px;
+            Rectangle {
+                border-radius: 15px;
+                border-width: 1px;
+                border-color: T.line;
+                background: T.panel;
+                horizontal-stretch: 0;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            border-radius: 3.5px;
+                            background: root.status-kind == 2 ? T.speak : root.status-kind == 1 ? T.warn : root.status-kind == 3 ? T.danger : T.faint;
+                        }
+                    }
+                    Text {
+                        text: root.status-text;
+                        color: T.muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    if root.status-kind == 2 && root.ping-text != "": Text {
+                        text: root.ping-text;
+                        color: T.text;
+                        font-size: 12px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Text {
+                text: root.notice != "" ? root.notice : root.status-detail;
+                color: root.notice != "" ? T.warn : T.faint;
+                font-size: 12px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            if root.page != 2: Rectangle {
+                border-radius: 15px;
+                border-width: 1px;
+                border-color: root.issues.length > 0 ? #4a3a22 : T.line;
+                background: net-ta.has-hover ? T.raised : (root.issues.length > 0 ? #211b12 : T.panel);
+                horizontal-stretch: 0;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            border-radius: 3.5px;
+                            background: !root.diag-done ? T.faint : root.issues.length > 0 ? T.warn : T.speak;
+                        }
+                    }
+                    Text {
+                        text: !root.diag-done ? "Сеть: проверка…" : root.issues.length > 0 ? "Сеть: замечаний " + root.issues.length : "Сеть: в порядке";
+                        color: root.issues.length > 0 ? T.warn : T.muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+                net-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.go(2);
+                    }
+                }
+            }
+        }
+
+        // --- главный экран ---
+        if root.page == 0: HorizontalLayout {
+            spacing: 12px;
+
+            Card {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 8px;
+                    padding-top: 12px;
+                    spacing: 2px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-bottom: 8px;
+                        Text {
+                            text: root.status-kind == 2 ? "В КОМНАТЕ · " + root.users.length : "УЧАСТНИКИ";
+                            color: T.faint;
+                            font-size: 11px;
+                            font-weight: 600;
+                            letter-spacing: 0.6px;
+                            horizontal-stretch: 1;
+                        }
+                        if root.users.length > 1: Text {
+                            text: "ГРОМКОСТЬ";
+                            color: T.faint;
+                            font-size: 11px;
+                            font-weight: 600;
+                            letter-spacing: 0.6px;
+                        }
+                    }
+                    if root.users.length > 0: Flickable {
+                        content-height: root.users.length * 48px;
+                        VerticalLayout {
+                            spacing: 2px;
+                            alignment: start;
+                            for u in root.users: UserRow {
+                                user: u;
+                                volume-changed(v) => {
+                                    root.volume-changed(u.session, v);
+                                }
+                            }
+                        }
+                    }
+                    if root.users.length == 0: VerticalLayout {
+                        alignment: center;
+                        spacing: 14px;
+                        padding: 24px;
+                        Text {
+                            text: root.status-kind == 1 ? "Подключаемся…" : root.status-kind == 3 ? root.status-detail : "Нет подключения к серверу";
+                            color: T.muted;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            PlainButton {
+                                width: 180px;
+                                primary: !root.wants-connection;
+                                text: root.wants-connection ? "Отменить" : "Подключиться";
+                                clicked => {
+                                    root.toggle-connection();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                width: 240px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    BigButton {
+                        label: root.muted ? "Микрофон выкл." : "Микрофон";
+                        icon-on: Icons.mic;
+                        icon-off: Icons.mic-off;
+                        off: root.muted || root.deafened;
+                        clicked => {
+                            root.toggle-mute();
+                        }
+                    }
+                    BigButton {
+                        label: root.deafened ? "Звук выкл." : "Звук";
+                        icon-on: Icons.phones;
+                        icon-off: Icons.phones-off;
+                        off: root.deafened;
+                        clicked => {
+                            root.toggle-deafen();
+                        }
+                    }
+                }
+
+                Card {
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        Rectangle {
+                            height: 46px;
+                            border-radius: 10px;
+                            background: T.bg;
+                            HorizontalLayout {
+                                padding: 3px;
+                                spacing: 3px;
+                                Segment {
+                                    text: "По кнопке";
+                                    selected: !root.vad-mode;
+                                    clicked => {
+                                        root.set-vad-mode(false);
+                                    }
+                                }
+                                Segment {
+                                    text: "По голосу";
+                                    selected: root.vad-mode;
+                                    clicked => {
+                                        root.set-vad-mode(true);
+                                    }
+                                }
+                            }
+                        }
+                        if !root.vad-mode: HorizontalLayout {
+                            spacing: 8px;
+                            Caption {
+                                text: "Клавиша";
+                                horizontal-stretch: 1;
+                            }
+                            PlainButton {
+                                height: 36px;
+                                min-width: 110px;
+                                active: root.capturing-key;
+                                accent: T.warn;
+                                text: root.capturing-key ? "Нажмите клавишу…" : root.key-name;
+                                clicked => {
+                                    root.capture-key();
+                                }
+                            }
+                        }
+                        if root.vad-mode: HorizontalLayout {
+                            spacing: 8px;
+                            Caption {
+                                text: "Порог";
+                                width: 44px;
+                            }
+                            Rectangle {
+                                height: 36px;
+                                // уровень микрофона под ползунком порога
+                                Rectangle {
+                                    x: 0;
+                                    y: parent.height / 2 + 7px;
+                                    height: 2px;
+                                    width: parent.width * min(1, root.mic-level);
+                                    border-radius: 1px;
+                                    background: root.mic-level >= root.vad-threshold ? T.speak : T.faint;
+                                }
+                                VolSlider {
+                                    width: parent.width;
+                                    y: (parent.height - self.height) / 2;
+                                    maximum: 1.0;
+                                    value: root.vad-threshold;
+                                    changed(v) => {
+                                        root.threshold-changed(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Card {
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        Caption {
+                            text: "Шумоподавление";
+                        }
+                        Rectangle {
+                            height: 42px;
+                            border-radius: 10px;
+                            background: T.bg;
+                            HorizontalLayout {
+                                padding: 3px;
+                                spacing: 3px;
+                                Segment {
+                                    height: 36px;
+                                    text: "Выкл.";
+                                    selected: root.noise-mode == 0;
+                                    clicked => {
+                                        root.set-noise-mode(0);
+                                    }
+                                }
+                                Segment {
+                                    height: 36px;
+                                    text: "Лёгкое";
+                                    selected: root.noise-mode == 1;
+                                    clicked => {
+                                        root.set-noise-mode(1);
+                                    }
+                                }
+                                Segment {
+                                    height: 36px;
+                                    text: "Сильное";
+                                    selected: root.noise-mode == 2;
+                                    clicked => {
+                                        root.set-noise-mode(2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                PlainButton {
+                    height: 46px;
+                    border-radius: 14px;
+                    icon: Icons.pulse;
+                    active: root.mic-test;
+                    accent: T.speak;
+                    text: root.mic-test ? "Вы слышите себя · остановить" : "Проверить свой голос";
+                    clicked => {
+                        root.toggle-mic-test();
+                    }
+                }
+
+                Card {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        alignment: start;
+                        Field {
+                            label: "Микрофон";
+                            ComboBox {
+                                height: 36px;
+                                model: root.in-devices;
+                                current-index <=> root.in-index;
+                                selected => {
+                                    root.input-selected(self.current-index);
+                                }
+                            }
+                        }
+                        Field {
+                            label: "Наушники";
+                            ComboBox {
+                                height: 36px;
+                                model: root.out-devices;
+                                current-index <=> root.out-index;
+                                selected => {
+                                    root.output-selected(self.current-index);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- подключение и настройки ---
+        if root.page == 1: HorizontalLayout {
+            spacing: 12px;
+
+            Card {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    alignment: start;
+                    Text {
+                        text: "Подключение";
+                        color: T.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+                    Field {
+                        label: "Адрес сервера";
+                        LineEdit {
+                            height: 36px;
+                            text <=> root.server;
+                            placeholder-text: "из кода приглашения";
+                        }
+                    }
+                    Field {
+                        label: "Ваше имя";
+                        LineEdit {
+                            height: 36px;
+                            text <=> root.username;
+                            placeholder-text: "как вас увидят друзья";
+                        }
+                    }
+                    Field {
+                        label: "Пароль сервера";
+                        LineEdit {
+                            height: 36px;
+                            text <=> root.password;
+                            input-type: InputType.password;
+                        }
+                    }
+                    SettingRow {
+                        title: "Подключаться при запуске";
+                        checked: root.autoconnect;
+                        toggled(v) => {
+                            root.set-autoconnect(v);
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        PlainButton {
+                            primary: true;
+                            horizontal-stretch: 1;
+                            text: "Сохранить и подключиться";
+                            enabled: root.server != "" && root.username != "";
+                            clicked => {
+                                root.save-connection();
+                            }
+                        }
+                        if root.wants-connection: PlainButton {
+                            width: 120px;
+                            text: "Отключиться";
+                            clicked => {
+                                root.toggle-connection();
+                            }
+                        }
+                    }
+                    if root.invite-code != "": Rectangle {
+                        height: 1px;
+                        background: T.line;
+                    }
+                    if root.invite-code != "": Field {
+                        label: "Код приглашения для друзей (отправляйте лично)";
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                height: 36px;
+                                horizontal-stretch: 1;
+                                border-radius: 10px;
+                                background: T.bg;
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    text: root.invite-code;
+                                    color: T.text;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            PlainButton {
+                                width: 110px;
+                                height: 36px;
+                                text: "Копировать";
+                                clicked => {
+                                    root.copy-invite();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Card {
+                width: 270px;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    alignment: start;
+                    Text {
+                        text: "Настройки";
+                        color: T.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+                    SettingRow {
+                        title: "Запускать вместе с Windows";
+                        hint: "Свёрнутой в трей.";
+                        checked: root.autostart;
+                        toggled(v) => {
+                            root.set-autostart(v);
+                        }
+                    }
+                    SettingRow {
+                        title: "Запускать в трее";
+                        hint: "Окно не показывается при старте.";
+                        checked: root.start-minimized;
+                        toggled(v) => {
+                            root.set-start-minimized(v);
+                        }
+                    }
+                    SettingRow {
+                        title: "Отключать Cloudflare WARP";
+                        hint: "При запуске программы.";
+                        checked: root.disable-warp;
+                        toggled(v) => {
+                            root.set-disable-warp(v);
+                        }
+                    }
+                    SettingRow {
+                        title: "Ограничить фоновые загрузки";
+                        hint: "Steam, лаунчеры и обновления Windows не займут канал. Нужны права администратора.";
+                        checked: root.game-mode;
+                        toggled(v) => {
+                            root.set-game-mode(v);
+                        }
+                    }
+                    if root.server-available: SettingRow {
+                        title: "Сервер на этом компьютере";
+                        hint: "Работает, пока запущена «Рация».";
+                        checked: root.run-server;
+                        toggled(v) => {
+                            root.set-run-server(v);
+                        }
+                    }
+                    Rectangle {
+                        height: 1px;
+                        background: T.line;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            alignment: center;
+                            Text {
+                                text: "Сетевые настройки Windows";
+                                color: T.text;
+                                font-size: 13px;
+                            }
+                            Text {
+                                text: root.system-busy ? "Выполняется…" : root.tweaks-applied ? "Применены" : "Не применены";
+                                color: root.tweaks-applied ? T.speak : T.warn;
+                                font-size: 11px;
+                            }
+                        }
+                    }
+                    PlainButton {
+                        height: 34px;
+                        enabled: !root.system-busy;
+                        text: root.tweaks-applied ? "Применить заново" : "Применить (права администратора)";
+                        clicked => {
+                            root.apply-tweaks();
+                        }
+                    }
+                    Text {
+                        text: "Рация " + root.app-version + " · интерфейс сделан на Slint";
+                        color: T.faint;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+
+        // --- проверка сети ---
+        if root.page == 2: VerticalLayout {
+            spacing: 10px;
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text {
+                        text: "Проверка сети";
+                        color: T.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: root.diag-running ? "Проверяю…" : root.diag-facts;
+                        color: T.faint;
+                        font-size: 12px;
+                        overflow: elide;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    PlainButton {
+                        width: 150px;
+                        height: 36px;
+                        enabled: !root.diag-running;
+                        text: "Проверить снова";
+                        clicked => {
+                            root.rerun-diag();
+                        }
+                    }
+                }
+            }
+            if root.issues.length == 0: Card {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    padding: 24px;
+                    Text {
+                        text: root.diag-done ? "Ничего, что мешает связи, не найдено" : "Идёт первая проверка…";
+                        color: T.text;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Проверяются VPN и прокси, тип подключения, связь с роутером и интернетом, загрузка канала, путь до сервера и сетевые настройки Windows.";
+                        color: T.faint;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            if root.issues.length > 0: Flickable {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    for it[i] in root.issues: IssueCard {
+                        issue: it;
+                        fix-clicked => {
+                            root.fix-issue(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- установка ---
+        if root.page == 3: VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Card {
+                    width: 440px;
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 14px;
+                        Text {
+                            text: root.install-upgrade ? "Обновление Рации до " + root.app-version : "Установка Рации " + root.app-version;
+                            color: T.text;
+                            font-size: 18px;
+                            font-weight: 600;
+                        }
+                        Text {
+                            text: "Программа установится для вашей учётной записи, подключит виртуальную сеть ZeroTier до сервера и применит одинаковые для всех сетевые настройки Windows. В процессе Windows один раз спросит разрешение администратора.";
+                            color: T.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        Field {
+                            label: "Код приглашения (его присылает владелец сервера)";
+                            LineEdit {
+                                height: 36px;
+                                enabled: !root.install-busy;
+                                text <=> root.install-invite;
+                                placeholder-text: "номер_сети@адрес_сервера";
+                            }
+                        }
+                        SettingRow {
+                            title: "Запускать вместе с Windows";
+                            hint: "Свёрнутой в трей.";
+                            checked: root.install-autostart;
+                            toggled(v) => {
+                                root.install-autostart = v;
+                            }
+                        }
+                        PlainButton {
+                            primary: true;
+                            height: 46px;
+                            enabled: !root.install-busy;
+                            text: root.install-busy ? "Устанавливаю…" : root.install-upgrade ? "Обновить" : "Установить";
+                            clicked => {
+                                root.install-clicked();
+                            }
+                        }
+                        Text {
+                            text: root.install-status;
+                            color: T.warn;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                            min-height: 32px;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

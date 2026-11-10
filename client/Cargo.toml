@@ -1,0 +1,68 @@
+[package]
+name = "raciya"
+version = "0.2.0"
+edition = "2021"
+description = "Лёгкий голосовой чат для игр, совместимый с протоколом Mumble"
+build = "build.rs"
+
+[dependencies]
+prost = { version = "0.13", default-features = false, features = ["derive", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17"
+aes = "0.8"
+opus = "0.3"
+cpal = "0.15"
+nnnoiseless = { version = "0.5", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# HTTPS-запросы: проверка и загрузка обновлений с GitHub.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Интерфейс: Slint с программной отрисовкой — без видеокарты, чтобы не мешать игре.
+slint = { version = "1", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-software",
+    "raw-window-handle-06",
+] }
+raw-window-handle = "0.6"
+tray-icon = "0.19"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_JobObjects",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_DataExchange",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+]
+
+[build-dependencies]
+slint-build = "1"
+winresource = "0.1"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,7 @@
+[env]
+# libopus собирается через CMake; CMake 4.x требует явного разрешения старых cmake_minimum_required.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+[target.x86_64-pc-windows-msvc]
+# Статическая CRT: готовый .exe не требует установки Visual C++ Redistributable у друзей.
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -6,13 +6,14 @@ use crate::config::Config;
 use crate::net::{describe_connect_error, Link, LinkEvent, LinkHandler};
 use crate::proto;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum Status {
+    #[default]
     Offline,
     Connecting,
     Online,
@@ -30,6 +31,21 @@ pub enum Event {
     /// Результат назначения клавиши (`None` — отменено).
     KeyCaptured(Option<u32>),
     Devices { input: String, output: String },
+    /// Изменилось состояние сервера на этом компьютере — интерфейс перечитывает `Core::server_view()`.
+    Server,
+}
+
+/// Состояние сервера на этом компьютере для интерфейса.
+#[derive(Clone, Debug, Default)]
+pub struct ServerView {
+    pub enabled: bool,
+    pub starting: bool,
+    pub running: bool,
+    pub port: u16,
+    pub users: Vec<String>,
+    pub error: Option<String>,
+    /// Ошибку можно исправить системной настройкой (права администратора).
+    pub fixable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -84,8 +100,14 @@ pub struct Core {
     pings: Mutex<std::collections::VecDeque<f32>>,
     online_since: Mutex<Option<std::time::Instant>>,
     last_udp_stats: Mutex<(u32, u32)>,
-    /// Сервер Mumble, запущенный как подпроцесс (только на компьютере владельца).
-    server: Mutex<Option<Arc<crate::server::ServerHost>>>,
+    /// Встроенный сервер (только если на этом компьютере включён «Сервер»).
+    server: Mutex<Option<Arc<crate::server::Server>>>,
+    server_error: Mutex<Option<crate::server::StartError>>,
+    server_starting: AtomicBool,
+    /// Номер последней команды запуска/остановки: устаревшие попытки запуска отменяются.
+    server_gen: AtomicU64,
+    /// Для проверок: не пользоваться UDP (голос только через TCP-туннель).
+    pub no_udp: AtomicBool,
 }
 
 struct Bridge {
@@ -144,10 +166,15 @@ impl Core {
                 online_since: Mutex::new(None),
                 last_udp_stats: Mutex::new((0, 0)),
                 server: Mutex::new(None),
+                server_error: Mutex::new(None),
+                server_starting: AtomicBool::new(false),
+                server_gen: AtomicU64::new(0),
+                no_udp: AtomicBool::new(false),
             }
         });
         if persist {
-            core.apply_server_setting();
+            // После обновления прежняя копия программы может ещё несколько секунд держать порт.
+            core.apply_server_setting(8);
         }
 
         let (tx, _handle) = audio::spawn_audio(core.audio.clone(), core.devices.clone());
@@ -228,6 +255,7 @@ impl Core {
         if let Some(tx) = self.audio_tx.lock().unwrap().as_ref() {
             let _ = tx.send(AudioCmd::Stop);
         }
+        self.server_gen.fetch_add(1, Ordering::SeqCst);
         if let Some(s) = self.server.lock().unwrap().take() {
             s.stop();
         }
@@ -236,41 +264,137 @@ impl Core {
 
     // --- сервер на этом компьютере -----------------------------------------------------------
 
-    /// Запускает или останавливает сервер в соответствии с настройкой `run_server`.
-    pub fn apply_server_setting(&self) {
-        let want = self.cfg.lock().unwrap().run_server && crate::server::available();
-        let mut slot = self.server.lock().unwrap();
-        if want && slot.is_none() {
-            *slot = Some(crate::server::ServerHost::start());
-        } else if !want {
-            if let Some(s) = slot.take() {
-                s.stop();
+    /// Запускает, перенастраивает или останавливает встроенный сервер по настройкам `[host]`.
+    /// `retries` — сколько раз повторить запуск, если порт ещё занят (раз в секунду).
+    pub fn apply_server_setting(self: &Arc<Self>, retries: u32) {
+        let host = self.cfg.lock().unwrap().host();
+        let gen = self.server_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let current = self.server.lock().unwrap().take();
+        if let Some(s) = current {
+            if host.enabled && s.port() == host.port {
+                // Тот же порт: пароль и остальное применяются без перезапуска.
+                s.update(&host.settings());
+                *self.server.lock().unwrap() = Some(s);
+                self.emit(Event::Server);
+                return;
             }
+            s.stop();
+        }
+        *self.server_error.lock().unwrap() = None;
+        if !host.enabled {
+            self.server_starting.store(false, Ordering::SeqCst);
+            self.emit(Event::Server);
+            return;
+        }
+        self.server_starting.store(true, Ordering::SeqCst);
+        self.emit(Event::Server);
+        let core = self.clone();
+        let spawned = std::thread::Builder::new().name("server-start".into()).spawn(move || {
+            let mut attempt = 0;
+            loop {
+                if core.server_gen.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                let weak = Arc::downgrade(&core);
+                let notify = Box::new(move || {
+                    if let Some(c) = weak.upgrade() {
+                        c.emit(Event::Server);
+                    }
+                });
+                match crate::server::Server::start(host.settings(), crate::server::data_dir(), notify) {
+                    Ok(s) => {
+                        if core.server_gen.load(Ordering::SeqCst) != gen {
+                            s.stop();
+                            return;
+                        }
+                        clog!("сервер запущен на порту {}", s.port());
+                        *core.server.lock().unwrap() = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        let busy = matches!(e, crate::server::StartError::InUse { .. });
+                        if busy && attempt < retries {
+                            attempt += 1;
+                            std::thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
+                        clog!("сервер не запустился: {}", e.describe());
+                        *core.server_error.lock().unwrap() = Some(e);
+                        break;
+                    }
+                }
+            }
+            core.server_starting.store(false, Ordering::SeqCst);
+            core.emit(Event::Server);
+        });
+        if spawned.is_err() {
+            self.server_starting.store(false, Ordering::SeqCst);
         }
     }
 
-    pub fn set_run_server(&self, on: bool) {
-        self.cfg.lock().unwrap().run_server = on;
+    /// Новые настройки сервера: сохраняются и применяются сразу.
+    pub fn set_host(self: &Arc<Self>, host: crate::config::HostConfig) {
+        let (old_port, network) = {
+            let cfg = self.cfg.lock().unwrap();
+            (cfg.host.as_ref().map(|h| h.port), cfg.zt_network.clone())
+        };
+        if host.enabled && !network.is_empty() && old_port.is_some_and(|p| p != host.port) {
+            // Сеть ZeroTier пропускает только порт сервера: на компьютере-контроллере правим её правила.
+            let (core, port) = (self.clone(), host.port);
+            std::thread::spawn(move || match crate::zt::set_server_port(&network, port) {
+                Ok(true) => clog!("правила сети ZeroTier: теперь пропускают порт {port}"),
+                Ok(false) => core.emit(Event::Notice(format!(
+                    "сеть ZeroTier создана на другом компьютере — там нужно разрешить порт {port}"
+                ))),
+                Err(e) => core.emit(Event::Notice(format!("не удалось поменять правила ZeroTier: {e}"))),
+            });
+        }
+        {
+            let mut cfg = self.cfg.lock().unwrap();
+            // Включили сервер, а адрес для своего клиента не задан — подключаемся к себе.
+            if host.enabled && cfg.server.trim().is_empty() {
+                cfg.server = if host.port == crate::config::DEFAULT_PORT {
+                    "127.0.0.1".into()
+                } else {
+                    format!("127.0.0.1:{}", host.port)
+                };
+            }
+            cfg.host = Some(host);
+        }
         self.dirty.store(true, Ordering::Relaxed);
-        self.apply_server_setting();
+        self.flush_config();
+        self.apply_server_setting(2);
+    }
+
+    pub fn server_view(&self) -> ServerView {
+        let host = self.cfg.lock().unwrap().host();
+        let server = self.server.lock().unwrap().clone();
+        let error = self.server_error.lock().unwrap().clone();
+        ServerView {
+            enabled: host.enabled,
+            starting: self.server_starting.load(Ordering::SeqCst),
+            running: server.is_some(),
+            port: server.as_ref().map(|s| s.port()).unwrap_or(host.port),
+            users: server.map(|s| s.users().into_iter().map(|u| u.name).collect()).unwrap_or_default(),
+            fixable: error.as_ref().map(|e| e.fixable()).unwrap_or(false),
+            error: error.map(|e| e.describe()),
+        }
     }
 
     pub fn server_running(&self) -> bool {
-        self.server.lock().unwrap().as_ref().map(|s| s.is_running()).unwrap_or(false)
-    }
-
-    pub fn server_pid(&self) -> u32 {
-        self.server.lock().unwrap().as_ref().map(|s| s.pid()).unwrap_or(0)
+        self.server.lock().unwrap().is_some()
     }
 
     // --- диагностика -------------------------------------------------------------------------
 
     /// Сведения о текущем соединении для проверки сети.
     pub fn diag_context(&self) -> crate::diag::Context {
-        let (server_host, zt_network, runs_server) = {
+        let (server_host, server_port, zt_network, runs_server, host_port) = {
             let cfg = self.cfg.lock().unwrap();
-            (cfg.host_port().0, cfg.zt_network.clone(), cfg.run_server)
+            let (h, p) = cfg.host_port();
+            (h, p, cfg.zt_network.clone(), cfg.hosting(), cfg.host().port)
         };
+        let server_error = self.server_error.lock().unwrap().as_ref().map(|e| (e.describe(), e.fixable()));
         let (avg, jitter) = {
             let p = self.pings.lock().unwrap();
             if p.len() >= 3 {
@@ -299,14 +423,17 @@ impl Core {
             udp_active: link.as_ref().map(|l| l.udp_active()).unwrap_or(false),
             online_secs: self.online_since.lock().unwrap().map(|t| t.elapsed().as_secs()).unwrap_or(0),
             server_host,
+            server_port,
             zt_network,
             ping_avg: avg,
             ping_jitter: jitter,
             loss_percent: loss,
-            tweaks_applied: crate::system::tweaks_applied(),
             runs_server,
             server_running: self.server_running(),
-            user_dir: crate::system::user_dir(),
+            server_error,
+            host_port,
+            status: self.status(),
+            force: false,
         }
     }
 
@@ -359,8 +486,12 @@ impl Core {
             };
             let bridge = Arc::new(Bridge { core: Arc::downgrade(&self), audio: self.audio.clone(), gen });
             let mut was_online = false;
+            clog!("подключение к {host}:{port} как «{username}»");
             let reason = match Link::connect(&host, port, &username, &password, bridge) {
                 Ok(link) => {
+                    if self.no_udp.load(Ordering::Relaxed) {
+                        link.set_udp_disabled(true);
+                    }
                     *self.audio.link.write().unwrap() = Some(link.clone());
                     let closed = {
                         let mut c = self.ctl.lock().unwrap();
@@ -372,9 +503,15 @@ impl Core {
                     was_online = self.is_online();
                     link.close();
                     *self.audio.link.write().unwrap() = None;
-                    closed.unwrap_or_default()
+                    let reason = closed.unwrap_or_default();
+                    clog!("соединение закрыто: {reason}");
+                    reason
                 }
-                Err(e) => describe_connect_error(&e),
+                Err(e) => {
+                    let reason = describe_connect_error(&e);
+                    clog!("не удалось подключиться: {reason} ({e})");
+                    reason
+                }
             };
 
             self.my_session.store(0, Ordering::SeqCst);
@@ -392,6 +529,7 @@ impl Core {
                 c.want = false;
                 drop(c);
                 attempt = 0;
+                clog!("подключение остановлено: {f}");
                 self.set_status(Status::Failed(f));
                 continue;
             }
@@ -424,6 +562,7 @@ impl Core {
         }
         match ev {
             LinkEvent::Synced { session, .. } => {
+                clog!("на связи, сессия {session}");
                 self.my_session.store(session, Ordering::SeqCst);
                 *self.online_since.lock().unwrap() = Some(std::time::Instant::now());
                 self.pings.lock().unwrap().clear();
@@ -455,8 +594,8 @@ impl Core {
                     proto::REJECT_INVALID_USERNAME => {
                         c.fatal = Some("недопустимое имя".into());
                     }
-                    5 => c.reject = Some("это имя уже занято".into()),
-                    6 => c.reject = Some("сервер заполнен".into()),
+                    proto::REJECT_USERNAME_IN_USE => c.reject = Some("это имя уже занято".into()),
+                    proto::REJECT_SERVER_FULL => c.reject = Some("сервер заполнен".into()),
                     _ => c.reject = Some(if reason.is_empty() { "сервер отклонил вход".into() } else { reason }),
                 }
             }

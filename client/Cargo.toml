@@ -1,6 +1,6 @@
 [package]
 name = "raciya"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Лёгкий голосовой чат для игр, совместимый с протоколом Mumble"
 build = "build.rs"
@@ -28,6 +28,8 @@ slint = { version = "1", default-features = false, features = [
 ] }
 raw-window-handle = "0.6"
 tray-icon = "0.19"
+# Самоподписанный сертификат TLS для встроенного сервера (создаётся один раз).
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 
 [dependencies.windows-sys]
 version = "0.59"
@@ -40,8 +42,8 @@ features = [
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
-    "Win32_System_JobObjects",
-    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_IO",
     "Win32_System_DataExchange",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",

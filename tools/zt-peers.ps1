@@ -6,7 +6,10 @@ $token = (Get-Content "$ztDir\authtoken.secret" -Raw).Trim()
 $port = (Get-Content "$ztDir\zerotier-one.port" -Raw).Trim()
 $h = @{ 'X-ZT1-Auth' = $token }
 $api = "http://127.0.0.1:$port"
-$nwid = ((Get-Content 'C:\MyProjects\project1\server\zerotier-network.txt') -match '^network=') -replace '^network=', ''
+# Номер сети — из настроек «Рации» (поле zt_network).
+$cfg = Join-Path $env:APPDATA 'Raciya\config.toml'
+$nwid = @((Get-Content $cfg -Encoding UTF8) -match '^\s*zt_network\s*=') -replace '^\s*zt_network\s*=\s*"?([0-9a-fA-F]{16})"?.*$', '$1' | Select-Object -First 1
+if (-not $nwid) { throw "в $cfg не задана сеть ZeroTier (zt_network)" }
 
 $members = Invoke-RestMethod "$api/controller/network/$nwid/member" -Headers $h
 $peers = Invoke-RestMethod "$api/peer" -Headers $h

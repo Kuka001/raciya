@@ -27,8 +27,10 @@ fn s3(v: u128) -> u128 {
 }
 
 impl CryptState {
-    pub fn new(key: &[u8], client_nonce: &[u8], server_nonce: &[u8]) -> Option<Self> {
-        if key.len() != BLOCK || client_nonce.len() != BLOCK || server_nonce.len() != BLOCK {
+    /// `encrypt_iv` — счётчик своих пакетов, `decrypt_iv` — счётчик пакетов собеседника.
+    /// Клиент передаёт сюда `client_nonce, server_nonce` из `CryptSetup`, сервер — наоборот.
+    pub fn new(key: &[u8], encrypt_iv: &[u8], decrypt_iv: &[u8]) -> Option<Self> {
+        if key.len() != BLOCK || encrypt_iv.len() != BLOCK || decrypt_iv.len() != BLOCK {
             return None;
         }
         let mut s = CryptState {
@@ -40,8 +42,8 @@ impl CryptState {
             late: 0,
             lost: 0,
         };
-        s.encrypt_iv.copy_from_slice(client_nonce);
-        s.decrypt_iv.copy_from_slice(server_nonce);
+        s.encrypt_iv.copy_from_slice(encrypt_iv);
+        s.decrypt_iv.copy_from_slice(decrypt_iv);
         Some(s)
     }
 

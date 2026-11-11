@@ -1,7 +1,7 @@
 //! Окно, трей и связь интерфейса с ядром. Здесь же — экран установки.
 
 use crate::audio;
-use crate::config::Config;
+use crate::config::{Config, HostConfig};
 use crate::core::{Core, Event, Status};
 use crate::diag::{self, Fix, Severity};
 use crate::{system, update, win};
@@ -18,7 +18,8 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 slint::include_modules!();
 
 static CORE: OnceLock<Arc<Core>> = OnceLock::new();
-static DIAG_TX: OnceLock<Mutex<Sender<()>>> = OnceLock::new();
+/// Запрос проверки сети; `true` — по просьбе пользователя (без кэша медленных проверок).
+static DIAG_TX: OnceLock<Mutex<Sender<bool>>> = OnceLock::new();
 static VISIBLE: AtomicBool = AtomicBool::new(false);
 
 fn core() -> &'static Arc<Core> {
@@ -245,9 +246,90 @@ impl Ui {
     }
 
     fn refresh_system_state(&mut self) {
-        self.win.set_tweaks_applied(system::tweaks_applied());
+        self.win.set_qos_applied(system::qos_applied());
         self.win.set_game_mode(system::game_mode());
         self.win.set_autostart(system::autostart_enabled());
+    }
+
+    /// Состояние сервера на этом компьютере: строка в настройках и страница «Сервер».
+    fn apply_server_view(&mut self) {
+        let v = core().server_view();
+        let (state, text) = if !v.enabled {
+            (0, "Выключен".to_string())
+        } else if v.starting {
+            (1, "Запускается…".to_string())
+        } else if v.running {
+            let n = v.users.len();
+            (2, format!("Работает · порт {} · участников: {n}", v.port))
+        } else if let Some(e) = &v.error {
+            (3, capitalize(e))
+        } else {
+            (0, "Не запущен".to_string())
+        };
+        self.win.set_srv_enabled(v.enabled);
+        self.win.set_srv_state(state);
+        self.win.set_srv_status(text.into());
+        self.win.set_srv_fixable(v.fixable);
+        self.win.set_srv_online(if v.running && !v.users.is_empty() {
+            format!("Сейчас на сервере: {}", v.users.join(", ")).into()
+        } else {
+            SharedString::new()
+        });
+        let zt_network = core().cfg.lock().unwrap().zt_network.clone();
+        let mut items = Vec::new();
+        let mut invite = String::new();
+        if v.enabled {
+            let port_suffix = if v.port == crate::config::DEFAULT_PORT { String::new() } else { format!(":{}", v.port) };
+            for (label, ip) in diag::local_addresses() {
+                let addr = format!("{ip}{port_suffix}");
+                if label == "ZeroTier" && !zt_network.is_empty() && invite.is_empty() {
+                    invite = system::make_invite(Some(&zt_network), &addr);
+                    items.push(AddressItem { label: "Код приглашения (через ZeroTier)".into(), value: invite.clone().into() });
+                } else {
+                    items.push(AddressItem { label: label.into(), value: addr.into() });
+                }
+            }
+        }
+        self.win.set_srv_addresses(ModelRc::new(VecModel::from(items)));
+        self.win.set_invite_code(invite.into());
+    }
+
+    /// Поля страницы «Сервер» — из сохранённых настроек.
+    fn fill_server_fields(&mut self) {
+        let h = core().cfg.lock().unwrap().host();
+        self.win.set_srv_password(h.password.into());
+        self.win.set_srv_port(h.port.to_string().into());
+        self.win.set_srv_users(h.max_users.to_string().into());
+        self.win.set_srv_welcome(h.welcome.into());
+    }
+
+    /// Настройки сервера из полей страницы. `Err` — текст ошибки для пользователя.
+    fn read_server_fields(&self, enabled: bool) -> Result<HostConfig, String> {
+        let port: u16 = self
+            .win
+            .get_srv_port()
+            .trim()
+            .parse()
+            .ok()
+            .filter(|&p| p > 0)
+            .ok_or("порт — число от 1 до 65535")?;
+        let users: u32 = self
+            .win
+            .get_srv_users()
+            .trim()
+            .parse()
+            .ok()
+            .filter(|n| (1..=1000).contains(n))
+            .ok_or("мест — число от 1 до 1000")?;
+        let current = core().cfg.lock().unwrap().host();
+        Ok(HostConfig {
+            enabled,
+            port,
+            max_users: users,
+            password: self.win.get_srv_password().to_string(),
+            welcome: self.win.get_srv_welcome().trim().to_string(),
+            ..current
+        })
     }
 }
 
@@ -259,31 +341,36 @@ fn refresh_devices() {
     });
 }
 
-fn request_diag() {
+fn request_diag(force: bool) {
     if let Some(tx) = DIAG_TX.get() {
-        let _ = tx.lock().unwrap().send(());
+        let _ = tx.lock().unwrap().send(force);
     }
 }
 
 /// Фоновая проверка сети: вскоре после запуска, затем изредка и по запросу.
 fn spawn_diag() {
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
     let _ = DIAG_TX.set(Mutex::new(tx));
     let _ = std::thread::Builder::new().name("diag".into()).spawn(move || {
         win::set_thread_priority(win::Prio::Low);
         std::thread::sleep(Duration::from_secs(5));
+        let mut force = false;
         loop {
             post(|ui| ui.win.set_diag_running(true));
-            let ctx = core().diag_context();
+            let mut ctx = core().diag_context();
+            ctx.force = force;
             let rep = diag::run(&ctx);
             post(move |ui| ui.apply_report(rep));
             // Пока окно свёрнуто (идёт игра), проверяем реже.
             let pause = if VISIBLE.load(Ordering::Relaxed) { 180 } else { 600 };
-            match rx.recv_timeout(Duration::from_secs(pause)) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            force = match rx.recv_timeout(Duration::from_secs(pause)) {
+                Ok(f) => f,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
                 Err(_) => return,
+            };
+            while let Ok(f) = rx.try_recv() {
+                force |= f;
             }
-            while rx.try_recv().is_ok() {}
         }
     });
 }
@@ -383,10 +470,35 @@ fn start_update() {
 
 /// Системная настройка с правами администратора (режимы — см. scripts/system-setup.ps1).
 fn run_system_setup(mode: &'static str) {
-    with_ui(|ui| ui.win.set_system_busy(true));
+    run_system_setup_then(mode, None);
+}
+
+/// Системная настройка; `then` выполняется после неё (даже если пользователь отказал в правах).
+fn run_system_setup_then(mode: &'static str, then: Option<Box<dyn FnOnce() + Send>>) {
+    let mut busy = false;
+    with_ui(|ui| {
+        busy = ui.win.get_system_busy();
+        ui.win.set_system_busy(true);
+    });
+    if busy {
+        return;
+    }
     std::thread::spawn(move || {
-        let network = core().cfg.lock().unwrap().zt_network.clone();
-        let result = system::request_system_setup(mode, &network);
+        let args = {
+            let cfg = core().cfg.lock().unwrap();
+            system::SetupArgs { network: cfg.zt_network.clone(), port: Some(cfg.host().port) }
+        };
+        let result = system::request_system_setup(mode, &args);
+        let ok = matches!(&result, Ok(r) if r.ok);
+        if mode == "server" {
+            diag::invalidate_cache();
+        }
+        match then {
+            Some(f) => f(),
+            // Порт теперь закреплён — пробуем запустить сервер ещё раз.
+            None if mode == "server" && (ok || core().server_view().error.is_some()) => core().apply_server_setting(2),
+            None => {}
+        }
         post(move |ui| {
             ui.win.set_system_busy(false);
             ui.refresh_system_state();
@@ -395,7 +507,11 @@ fn run_system_setup(mode: &'static str) {
                     match mode {
                         "gamemode-on" => "фоновые загрузки ограничены",
                         "gamemode-off" => "ограничение загрузок снято",
-                        _ => "сетевые настройки применены",
+                        "qos-on" => "приоритет голоса включён",
+                        "qos-off" => "приоритет голоса выключен",
+                        "server" => "компьютер настроен для сервера",
+                        "client" => "виртуальная сеть подключена",
+                        _ => "готово",
                     }
                     .into(),
                 ),
@@ -403,7 +519,7 @@ fn run_system_setup(mode: &'static str) {
                 Err(e) => ui.show_notice(e),
             }
         });
-        request_diag();
+        request_diag(true);
     });
 }
 
@@ -417,7 +533,7 @@ fn on_core_event(ev: Event) {
                 // Через несколько секунд после входа известно, работает ли быстрый канал.
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_secs(15));
-                    request_diag();
+                    request_diag(false);
                 });
             }
         }
@@ -434,6 +550,7 @@ fn on_core_event(ev: Event) {
             }
         }
         Event::Devices { .. } => refresh_devices(),
+        Event::Server => ui.apply_server_view(),
     });
 }
 
@@ -617,10 +734,10 @@ fn run_installer(install_now: bool) {
     window.set_install_upgrade(system::is_installed());
 
     // Приглашение: из файла invite.txt рядом с установщиком или из прежних настроек.
-    let base = std::env::var("APPDATA").map(std::path::PathBuf::from).unwrap_or_default();
-    let old = Config::load_from(base.join("Raciya").join("config.toml"));
-    let known = if !old.zt_network.is_empty() && !old.run_server {
-        Some(system::make_invite(&old.zt_network, &old.host_port().0))
+    let old = Config::load_from(crate::config::roaming_dir().join("config.toml"));
+    let known = if !old.server.trim().is_empty() && !old.hosting() && !old.run_server {
+        let net = (!old.zt_network.is_empty()).then_some(old.zt_network.as_str());
+        Some(system::make_invite(net, old.server.trim()))
     } else {
         None
     };
@@ -640,7 +757,7 @@ fn run_installer(install_now: bool) {
                 Some(i) => Some(i),
                 None => {
                     w.set_install_status(
-                        "Код приглашения выглядит неверно. Он должен иметь вид номер_сети@адрес_сервера — скопируйте его целиком."
+                        "Адрес или код выглядит неверно. Подойдёт адрес (192.168.0.15, myhost.example:64738) или код вида номер_сети@адрес — скопируйте его целиком."
                             .into(),
                     );
                     return;
@@ -662,7 +779,7 @@ fn run_installer(install_now: bool) {
                     if let Some(wtext) = warning {
                         win::message_box(
                             &format!(
-                                "«Рация» установлена, но {wtext}.\n\nПрограмма работает и без этого. Повторить настройку можно в ней самой: «Подключение и настройки» → «Сетевые настройки Windows»."
+                                "«Рация» установлена, но {wtext}.\n\nПовторить можно в самой программе: «Сеть» → «Исправить»."
                             ),
                             "Рация",
                             false,
@@ -715,14 +832,19 @@ pub fn run(args: &[String]) {
     }
     update::cleanup(&exe);
     win::set_thread_priority(win::Prio::Low);
+    crate::log::init_client(system::user_dir().join("raciya.log"));
+    crate::log::init_server(crate::server::data_dir().join("server.log"));
+    clog!("Рация {} запущена ({})", update::CURRENT, exe.display());
 
-    let cfg = Config::load();
+    let mut cfg = Config::load();
+    if cfg.migrate_legacy_server() {
+        clog!("настройки сервера перенесены из Mumble Server (версия 0.2)");
+        cfg.save();
+    }
+    system::cleanup_legacy();
     let complete = cfg.is_complete();
     let autoconnect = cfg.autoconnect && complete;
     let start_hidden = (cfg.start_minimized || has("--autostart")) && complete;
-    if cfg.disable_warp {
-        win::disconnect_warp();
-    }
 
     let window = AppWindow::new().expect("window");
     let users = Rc::new(VecModel::<UserItem>::default());
@@ -735,7 +857,6 @@ pub fn run(args: &[String]) {
     window.set_autoconnect(cfg.autoconnect);
     window.set_noise_mode(cfg.noise_mode as i32);
     window.set_start_minimized(cfg.start_minimized);
-    window.set_disable_warp(cfg.disable_warp);
     window.set_vad_mode(cfg.voice_activation);
     window.set_vad_threshold(rms_to_slider(cfg.vad_threshold));
     window.set_key_name(win::key_name(cfg.ptt_key).into());
@@ -744,10 +865,7 @@ pub fn run(args: &[String]) {
     window.set_app_version(update::CURRENT.into());
     window.set_autostart(system::autostart_enabled());
     window.set_game_mode(system::game_mode());
-    window.set_tweaks_applied(system::tweaks_applied());
-    window.set_server_available(crate::server::available());
-    window.set_run_server(cfg.run_server);
-    window.set_invite_code(if cfg.run_server { cfg.invite.clone() } else { String::new() }.into());
+    window.set_qos_applied(system::qos_applied());
     let empty: Vec<SharedString> = vec![DEFAULT_DEVICE.into()];
     window.set_in_devices(ModelRc::new(VecModel::from(empty.clone())));
     window.set_out_devices(ModelRc::new(VecModel::from(empty)));
@@ -811,8 +929,31 @@ pub fn run(args: &[String]) {
         })
     });
     window.on_save_connection(|| {
+        let mut join_network = false;
         with_ui(|ui| {
-            let server = ui.win.get_server().to_string();
+            let text = ui.win.get_server().to_string();
+            // Код с виртуальной сетью: адрес — отдельно, сеть подключается (если ещё нет).
+            let server = match system::parse_invite(&text) {
+                Some(inv) => {
+                    if let Some(n) = inv.network {
+                        let mut cfg = core().cfg.lock().unwrap();
+                        if cfg.zt_network != n {
+                            cfg.zt_network = n;
+                            join_network = true;
+                        }
+                        core().mark_dirty();
+                    }
+                    inv.server
+                }
+                None => {
+                    if crate::config::parse_address(&text).is_none() {
+                        ui.show_notice("адрес сервера выглядит неверно".into());
+                        return;
+                    }
+                    text.trim().to_string()
+                }
+            };
+            ui.win.set_server(server.clone().into());
             let username = ui.win.get_username().to_string();
             let password = ui.win.get_password().to_string();
             let auto = ui.win.get_autoconnect();
@@ -820,7 +961,10 @@ pub fn run(args: &[String]) {
             ui.win.set_wants_connection(true);
             ui.win.set_page(0);
             ui.update_level_timer();
-        })
+        });
+        if join_network {
+            run_system_setup("client");
+        }
     });
     window.on_toggle_connection(|| {
         with_ui(|ui| {
@@ -849,20 +993,23 @@ pub fn run(args: &[String]) {
         core().mark_dirty();
         with_ui(|ui| ui.win.set_start_minimized(on));
     });
-    window.on_set_disable_warp(|on| {
-        core().cfg.lock().unwrap().disable_warp = on;
-        core().mark_dirty();
-        with_ui(|ui| ui.win.set_disable_warp(on));
-    });
     window.on_threshold_changed(|v| {
         core().set_vad_threshold(slider_to_rms(v));
         with_ui(|ui| ui.win.set_vad_threshold(v));
     });
-    window.on_page_changed(|_| with_ui(|ui| ui.update_level_timer()));
+    window.on_page_changed(|page| {
+        with_ui(|ui| {
+            ui.update_level_timer();
+            if page == 4 {
+                ui.fill_server_fields();
+                ui.apply_server_view();
+            }
+        })
+    });
     window.on_update_clicked(version_clicked);
     window.on_rerun_diag(|| {
         with_ui(|ui| ui.win.set_diag_running(true));
-        request_diag();
+        request_diag(true);
     });
     window.on_fix_issue(|i| {
         let mut fix = Fix::None;
@@ -876,10 +1023,26 @@ pub fn run(args: &[String]) {
                 });
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_secs(4));
-                    request_diag();
+                    request_diag(true);
                 });
             }
-            Fix::ApplyTweaks => run_system_setup("apply"),
+            Fix::JoinZeroTier => run_system_setup("client"),
+            Fix::ServerSetup => run_system_setup("server"),
+            Fix::ZeroTierRules => {
+                let (network, port) = {
+                    let cfg = core().cfg.lock().unwrap();
+                    (cfg.zt_network.clone(), cfg.host().port)
+                };
+                std::thread::spawn(move || {
+                    let text = match crate::zt::set_server_port(&network, port) {
+                        Ok(true) => format!("сеть ZeroTier теперь пропускает порт {port}"),
+                        Ok(false) => "сеть ZeroTier создана на другом компьютере — правила меняют там".into(),
+                        Err(e) => format!("не удалось: {e}"),
+                    };
+                    post(move |ui| ui.show_notice(text));
+                    request_diag(true);
+                });
+            }
             Fix::None => {}
         }
     });
@@ -888,19 +1051,64 @@ pub fn run(args: &[String]) {
         with_ui(|ui| ui.win.set_autostart(system::autostart_enabled()));
     });
     window.on_set_game_mode(|on| run_system_setup(if on { "gamemode-on" } else { "gamemode-off" }));
-    window.on_apply_tweaks(|| run_system_setup("apply"));
-    window.on_set_run_server(|on| {
-        core().set_run_server(on);
-        with_ui(|ui| {
-            ui.win.set_run_server(on);
-            let invite = if on { core().cfg.lock().unwrap().invite.clone() } else { String::new() };
-            ui.win.set_invite_code(invite.into());
+    window.on_set_qos(|on| run_system_setup(if on { "qos-on" } else { "qos-off" }));
+    window.on_set_server_enabled(|on| {
+        let mut host = None;
+        with_ui(|ui| match ui.read_server_fields(on) {
+            Ok(h) => host = Some(h),
+            Err(e) => {
+                ui.show_notice(e);
+                ui.win.set_srv_enabled(!on);
+            }
         });
+        let Some(host) = host else { return };
+        // Первое включение на этом компьютере: сначала брандмауэр и закрепление порта (одно окно UAC),
+        // потом запуск. Тогда Windows не показывает свой запрос, где «Отмена» заблокировала бы сервер.
+        if on && system::server_setup_port() != Some(host.port) {
+            with_ui(|ui| ui.win.set_srv_status("Настраиваю компьютер для сервера…".into()));
+            // Настройка берёт порт из сохранённых настроек — кладём туда новые значения заранее.
+            core().cfg.lock().unwrap().host = Some(host.clone());
+            core().mark_dirty();
+            run_system_setup_then("server", Some(Box::new(move || core().set_host(host))));
+        } else {
+            core().set_host(host);
+        }
+    });
+    window.on_save_server(|| {
+        let mut host = None;
+        with_ui(|ui| match ui.read_server_fields(ui.win.get_srv_enabled()) {
+            Ok(h) => host = Some(h),
+            Err(e) => ui.show_notice(e),
+        });
+        let Some(host) = host else { return };
+        let port_changed = core().cfg.lock().unwrap().host().port != host.port;
+        with_ui(|ui| ui.show_notice("настройки сервера сохранены".into()));
+        if host.enabled && port_changed && system::server_setup_port() != Some(host.port) {
+            // Новый порт: правила брандмауэра и закрепление — до запуска сервера на нём.
+            core().cfg.lock().unwrap().host = Some(host.clone());
+            core().mark_dirty();
+            run_system_setup_then("server", Some(Box::new(move || core().set_host(host))));
+        } else {
+            core().set_host(host);
+        }
+    });
+    window.on_fix_server(|| run_system_setup("server"));
+    window.on_copy_text(|text| {
+        let ok = win::copy_to_clipboard(&text);
+        with_ui(|ui| ui.show_notice(if ok { format!("скопировано: {text}") } else { "не удалось скопировать".into() }));
     });
     window.on_copy_invite(|| {
-        let invite = core().cfg.lock().unwrap().invite.clone();
-        let ok = win::copy_to_clipboard(&invite);
+        let mut invite = String::new();
+        with_ui(|ui| invite = ui.win.get_invite_code().to_string());
+        let ok = !invite.is_empty() && win::copy_to_clipboard(&invite);
         with_ui(|ui| ui.show_notice(if ok { "код приглашения скопирован".into() } else { "не удалось скопировать".into() }));
+    });
+    window.on_open_log(|| {
+        if let Some(path) = crate::log::client_path() {
+            let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
+        }
     });
 
     // Крестик сворачивает в трей, а не закрывает программу.
@@ -972,6 +1180,10 @@ pub fn run(args: &[String]) {
         core().connect();
         with_ui(|ui| ui.win.set_wants_connection(true));
     }
+    with_ui(|ui| {
+        ui.fill_server_fields();
+        ui.apply_server_view();
+    });
     spawn_diag();
     spawn_update_checker();
     // Windows прячет новые значки в скрытую область; выносим свой на видное место.
@@ -1009,6 +1221,11 @@ pub fn run(args: &[String]) {
                         win.set_page(2);
                         win.invoke_page_changed(2);
                     }
+                    "page4" => {
+                        win.set_page(4);
+                        win.invoke_page_changed(4);
+                    }
+                    "fixserver" => win.invoke_fix_server(),
                     "hide" => with_ui(|ui| ui.hide()),
                     _ => {}
                 }

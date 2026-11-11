@@ -1,5 +1,10 @@
 import { ComboBox, LineEdit } from "std-widgets.slint";
 
+export struct AddressItem {
+    label: string,
+    value: string,
+}
+
 export struct UserItem {
     session: int,
     name: string,
@@ -35,6 +40,8 @@ global Icons {
     out property <string> wave: "M 5 10 L 5 14 M 9.5 7 L 9.5 17 M 14 4 L 14 20 M 18.5 8 L 18.5 16";
     out property <string> pulse: "M 3 12 L 6 12 L 9 5 L 13 19 L 16 12 L 21 12";
     out property <string> back: "M 15 5 L 8 12 L 15 19";
+    out property <string> copy: "M 9 9 L 20 9 L 20 20 L 9 20 Z M 15 5 L 15 4 L 4 4 L 4 15 L 5 15";
+    out property <string> server: "M 4 4 L 20 4 L 20 10 L 4 10 Z M 4 14 L 20 14 L 20 20 L 4 20 Z M 7 7 L 8 7 M 7 17 L 8 17";
     out property <string> sliders: "M 4 6 L 13 6 M 19 6 L 20 6 M 4 12 L 7 12 M 13 12 L 20 12 M 4 18 L 15 18 M 21 18 L 20 18 M 18.5 6 A 2.5 2.5 0 1 1 13.5 6 A 2.5 2.5 0 1 1 18.5 6 M 12.5 12 A 2.5 2.5 0 1 1 7.5 12 A 2.5 2.5 0 1 1 12.5 12 M 20.5 18 A 2.5 2.5 0 1 1 15.5 18 A 2.5 2.5 0 1 1 20.5 18";
 }
 
@@ -483,7 +490,6 @@ export component AppWindow inherits Window {
     // 0 — выключено, 1 — лёгкое, 2 — сильное
     in property <int> noise-mode;
     in property <bool> start-minimized;
-    in property <bool> disable-warp: true;
     in property <float> vad-threshold: 0.2;
     in property <float> mic-level;
     in property <string> notice;
@@ -503,10 +509,21 @@ export component AppWindow inherits Window {
     // системные настройки
     in property <bool> autostart;
     in property <bool> game-mode;
-    in property <bool> tweaks-applied;
+    in property <bool> qos-applied;
     in property <bool> system-busy;
-    in property <bool> server-available;
-    in property <bool> run-server;
+
+    // сервер на этом компьютере
+    in property <bool> srv-enabled;
+    // 0 — выключен, 1 — запускается, 2 — работает, 3 — ошибка
+    in property <int> srv-state;
+    in property <string> srv-status: "Выключен";
+    in property <bool> srv-fixable;
+    in-out property <string> srv-password;
+    in-out property <string> srv-port: "64738";
+    in-out property <string> srv-users: "10";
+    in-out property <string> srv-welcome;
+    in property <[AddressItem]> srv-addresses;
+    in property <string> srv-online;
     in property <string> invite-code;
 
     // установка
@@ -530,7 +547,6 @@ export component AppWindow inherits Window {
     callback set-autoconnect(bool);
     callback set-noise-mode(int);
     callback set-start-minimized(bool);
-    callback set-disable-warp(bool);
     callback threshold-changed(float);
     callback page-changed(int);
     callback update-clicked();
@@ -538,9 +554,13 @@ export component AppWindow inherits Window {
     callback fix-issue(int);
     callback set-autostart(bool);
     callback set-game-mode(bool);
-    callback apply-tweaks();
-    callback set-run-server(bool);
+    callback set-qos(bool);
+    callback set-server-enabled(bool);
+    callback save-server();
+    callback fix-server();
+    callback copy-text(string);
     callback copy-invite();
+    callback open-log();
     callback install-clicked();
 
     function go(p: int) {
@@ -569,7 +589,7 @@ export component AppWindow inherits Window {
                 }
                 back-ta := TouchArea {
                     clicked => {
-                        root.go(0);
+                        root.go(root.page == 4 ? 1 : 0);
                     }
                 }
             }
@@ -966,11 +986,11 @@ export component AppWindow inherits Window {
                         font-weight: 600;
                     }
                     Field {
-                        label: "Адрес сервера";
+                        label: "Адрес сервера или код приглашения";
                         LineEdit {
                             height: 36px;
                             text <=> root.server;
-                            placeholder-text: "из кода приглашения";
+                            placeholder-text: "например 192.168.0.15 или 10.77.64.1:64738";
                         }
                     }
                     Field {
@@ -1015,39 +1035,6 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if root.invite-code != "": Rectangle {
-                        height: 1px;
-                        background: T.line;
-                    }
-                    if root.invite-code != "": Field {
-                        label: "Код приглашения для друзей (отправляйте лично)";
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Rectangle {
-                                height: 36px;
-                                horizontal-stretch: 1;
-                                border-radius: 10px;
-                                background: T.bg;
-                                Text {
-                                    x: 10px;
-                                    width: parent.width - 20px;
-                                    text: root.invite-code;
-                                    color: T.text;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                            }
-                            PlainButton {
-                                width: 110px;
-                                height: 36px;
-                                text: "Копировать";
-                                clicked => {
-                                    root.copy-invite();
-                                }
-                            }
-                        }
-                    }
                 }
             }
 
@@ -1080,14 +1067,6 @@ export component AppWindow inherits Window {
                         }
                     }
                     SettingRow {
-                        title: "Отключать Cloudflare WARP";
-                        hint: "При запуске программы.";
-                        checked: root.disable-warp;
-                        toggled(v) => {
-                            root.set-disable-warp(v);
-                        }
-                    }
-                    SettingRow {
                         title: "Ограничить фоновые загрузки";
                         hint: "Steam, лаунчеры и обновления Windows не займут канал. Нужны права администратора.";
                         checked: root.game-mode;
@@ -1095,12 +1074,12 @@ export component AppWindow inherits Window {
                             root.set-game-mode(v);
                         }
                     }
-                    if root.server-available: SettingRow {
-                        title: "Сервер на этом компьютере";
-                        hint: "Работает, пока запущена «Рация».";
-                        checked: root.run-server;
+                    SettingRow {
+                        title: "Приоритет голоса (QoS)";
+                        hint: root.system-busy ? "Выполняется…" : "Метка DSCP для голосовых пакетов, помогает на Wi-Fi. Нужны права администратора.";
+                        checked: root.qos-applied;
                         toggled(v) => {
-                            root.set-run-server(v);
+                            root.set-qos(v);
                         }
                     }
                     Rectangle {
@@ -1114,30 +1093,63 @@ export component AppWindow inherits Window {
                             spacing: 2px;
                             alignment: center;
                             Text {
-                                text: "Сетевые настройки Windows";
+                                text: "Сервер на этом компьютере";
                                 color: T.text;
                                 font-size: 13px;
                             }
                             Text {
-                                text: root.system-busy ? "Выполняется…" : root.tweaks-applied ? "Применены" : "Не применены";
-                                color: root.tweaks-applied ? T.speak : T.warn;
+                                text: root.srv-status;
+                                color: root.srv-state == 2 ? T.speak : root.srv-state == 3 ? T.warn : T.faint;
                                 font-size: 11px;
+                                overflow: elide;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            PlainButton {
+                                width: 96px;
+                                height: 34px;
+                                icon: Icons.server;
+                                text: "Сервер";
+                                clicked => {
+                                    root.go(4);
+                                }
                             }
                         }
                     }
-                    PlainButton {
-                        height: 34px;
-                        enabled: !root.system-busy;
-                        text: root.tweaks-applied ? "Применить заново" : "Применить (права администратора)";
-                        clicked => {
-                            root.apply-tweaks();
-                        }
+                    Rectangle {
+                        height: 1px;
+                        background: T.line;
                     }
-                    Text {
-                        text: "Рация " + root.app-version + " · интерфейс сделан на Slint";
-                        color: T.faint;
-                        font-size: 11px;
-                        wrap: word-wrap;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            horizontal-stretch: 1;
+                            text: "Рация " + root.app-version + " · интерфейс сделан на Slint";
+                            color: T.faint;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            width: 64px;
+                            height: 28px;
+                            border-radius: 8px;
+                            background: log-ta.has-hover ? T.raised : transparent;
+                            Text {
+                                text: "Журнал";
+                                color: T.muted;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            log-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.open-log();
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1213,6 +1225,169 @@ export component AppWindow inherits Window {
             }
         }
 
+        // --- сервер на этом компьютере ---
+        if root.page == 4: HorizontalLayout {
+            spacing: 12px;
+
+            Card {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    alignment: start;
+                    Text {
+                        text: "Сервер на этом компьютере";
+                        color: T.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+                    SettingRow {
+                        title: "Включить сервер";
+                        hint: "Друзья подключаются к этому компьютеру. Сервер работает, пока запущена «Рация».";
+                        checked: root.srv-enabled;
+                        toggled(v) => {
+                            root.set-server-enabled(v);
+                        }
+                    }
+                    Field {
+                        label: "Пароль сервера";
+                        LineEdit {
+                            height: 36px;
+                            text <=> root.srv-password;
+                            input-type: InputType.password;
+                            placeholder-text: "без пароля — только для своей сети";
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: start;
+                        Field {
+                            width: 120px;
+                            label: "Порт";
+                            LineEdit {
+                                width: 120px;
+                                height: 36px;
+                                text <=> root.srv-port;
+                                input-type: InputType.number;
+                            }
+                        }
+                        Field {
+                            width: 90px;
+                            label: "Мест";
+                            LineEdit {
+                                width: 90px;
+                                height: 36px;
+                                text <=> root.srv-users;
+                                input-type: InputType.number;
+                            }
+                        }
+                    }
+                    Field {
+                        label: "Приветствие";
+                        LineEdit {
+                            height: 36px;
+                            text <=> root.srv-welcome;
+                            placeholder-text: "необязательно";
+                        }
+                    }
+                    PlainButton {
+                        primary: true;
+                        text: "Сохранить";
+                        clicked => {
+                            root.save-server();
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: start;
+                            padding-top: 4px;
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: root.srv-state == 2 ? T.speak : root.srv-state == 3 ? T.danger : root.srv-state == 1 ? T.warn : T.faint;
+                            }
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: root.srv-status;
+                            color: root.srv-state == 3 ? T.warn : T.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if root.srv-fixable: PlainButton {
+                        enabled: !root.system-busy;
+                        text: root.system-busy ? "Выполняется…" : "Исправить (права администратора)";
+                        clicked => {
+                            root.fix-server();
+                        }
+                    }
+                }
+            }
+
+            Card {
+                width: 270px;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+                    alignment: start;
+                    Text {
+                        text: "Как подключиться";
+                        color: T.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: root.srv-addresses.length > 0 ? "Друзья вводят адрес и пароль сервера в «Подключение и настройки»." : "Включите сервер — здесь появятся адреса для друзей.";
+                        color: T.faint;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    for a in root.srv-addresses: VerticalLayout {
+                        spacing: 4px;
+                        Caption {
+                            text: a.label;
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Rectangle {
+                                height: 34px;
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: T.bg;
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    text: a.value;
+                                    color: T.text;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            PlainButton {
+                                width: 40px;
+                                height: 34px;
+                                border-radius: 8px;
+                                icon: Icons.copy;
+                                clicked => {
+                                    root.copy-text(a.value);
+                                }
+                            }
+                        }
+                    }
+                    if root.srv-online != "": Text {
+                        text: root.srv-online;
+                        color: T.muted;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+
         // --- установка ---
         if root.page == 3: VerticalLayout {
             alignment: center;
@@ -1230,18 +1405,18 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Text {
-                            text: "Программа установится для вашей учётной записи, подключит виртуальную сеть ZeroTier до сервера и применит одинаковые для всех сетевые настройки Windows. В процессе Windows один раз спросит разрешение администратора.";
+                            text: "Программа установится для вашей учётной записи — без прав администратора. Только если в коде приглашения есть виртуальная сеть ZeroTier, Windows один раз спросит разрешение, чтобы её подключить.";
                             color: T.muted;
                             font-size: 12px;
                             wrap: word-wrap;
                         }
                         Field {
-                            label: "Код приглашения (его присылает владелец сервера)";
+                            label: "Адрес сервера или код приглашения (необязательно)";
                             LineEdit {
                                 height: 36px;
                                 enabled: !root.install-busy;
                                 text <=> root.install-invite;
-                                placeholder-text: "номер_сети@адрес_сервера";
+                                placeholder-text: "его присылает владелец сервера";
                             }
                         }
                         SettingRow {

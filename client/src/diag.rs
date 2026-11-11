@@ -1,7 +1,9 @@
 //! Диагностика сети: ищет то, что мешает связи и повышает пинг (VPN, прокси, Wi-Fi,
 //! ретранслятор, занятый канал, плохая связь с роутером), и объясняет, что с этим делать.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GetBestInterface, GetIfEntry2, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
     GAA_FLAG_INCLUDE_GATEWAYS, ICMP_ECHO_REPLY, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
@@ -20,7 +22,12 @@ pub enum Severity {
 pub enum Fix {
     None,
     DisableWarp,
-    ApplyTweaks,
+    /// Подключить виртуальную сеть ZeroTier заново (права администратора).
+    JoinZeroTier,
+    /// Настроить компьютер-сервер: брандмауэр и закрепление порта (права администратора).
+    ServerSetup,
+    /// Разрешить порт сервера в правилах сети ZeroTier (на компьютере-контроллере).
+    ZeroTierRules,
 }
 
 #[derive(Clone, Debug)]
@@ -45,14 +52,21 @@ pub struct Context {
     pub udp_active: bool,
     pub online_secs: u64,
     pub server_host: String,
+    pub server_port: u16,
     pub zt_network: String,
     pub ping_avg: Option<f32>,
     pub ping_jitter: Option<f32>,
     pub loss_percent: Option<f32>,
-    pub tweaks_applied: bool,
+    /// На этом компьютере включён сервер.
     pub runs_server: bool,
     pub server_running: bool,
-    pub user_dir: std::path::PathBuf,
+    /// Почему сервер не запустился (текст, можно ли исправить настройкой).
+    pub server_error: Option<(String, bool)>,
+    /// Порт своего сервера.
+    pub host_port: u16,
+    pub status: crate::core::Status,
+    /// Проверку запросил пользователь: медленные проверки выполняются заново, без кэша.
+    pub force: bool,
 }
 
 struct Adapter {
@@ -62,6 +76,7 @@ struct Adapter {
     if_type: u32,
     up: bool,
     gateway: Option<Ipv4Addr>,
+    ipv4: Vec<Ipv4Addr>,
 }
 
 fn pwstr(p: *const u16) -> String {
@@ -106,6 +121,16 @@ fn adapters() -> Vec<Adapter> {
         let mut p = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
         while !p.is_null() {
             let a = &*p;
+            let mut ipv4 = Vec::new();
+            let mut u = a.FirstUnicastAddress;
+            while !u.is_null() {
+                let sa = (*u).Address.lpSockaddr;
+                if !sa.is_null() && (*sa).sa_family == AF_INET {
+                    let sin = &*(sa as *const SOCKADDR_IN);
+                    ipv4.push(Ipv4Addr::from(u32::from_be(sin.sin_addr.S_un.S_addr)));
+                }
+                u = (*u).Next;
+            }
             let mut gateway = None;
             let mut g = a.FirstGatewayAddress;
             while !g.is_null() {
@@ -124,10 +149,35 @@ fn adapters() -> Vec<Adapter> {
                 if_type: a.IfType,
                 up: a.OperStatus == 1,
                 gateway,
+                ipv4,
             });
             p = a.Next;
         }
     }
+    out
+}
+
+/// Адреса этого компьютера, по которым к нему могут подключиться друзья:
+/// («Локальная сеть» | «ZeroTier», адрес). Виртуальные адаптеры Hyper-V не показываются.
+pub fn local_addresses() -> Vec<(&'static str, Ipv4Addr)> {
+    let mut out = Vec::new();
+    for a in adapters().iter().filter(|a| a.up) {
+        let d = format!("{} {}", a.name, a.description).to_lowercase();
+        let label = if d.contains("zerotier") {
+            "ZeroTier"
+        } else if matches!(a.if_type, 6 | 71) && !d.contains("hyper-v") && !d.contains("vethernet") && !vpn_like(a) {
+            "Локальная сеть"
+        } else {
+            continue;
+        };
+        for ip in &a.ipv4 {
+            if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() {
+                out.push((label, *ip));
+            }
+        }
+    }
+    // ZeroTier — первым: по нему подключаются друзья из интернета.
+    out.sort_by_key(|(l, _)| if *l == "ZeroTier" { 0 } else { 1 });
     out
 }
 
@@ -212,33 +262,11 @@ fn zt_link(ctx: &Context) -> ZtLink {
     if ctx.zt_network.len() < 10 {
         return ZtLink::Unknown;
     }
-    let server_node = &ctx.zt_network[..10];
-    let token = std::fs::read_to_string(ctx.user_dir.join("zt.token")).unwrap_or_default();
-    let token = token.trim();
-    if token.is_empty() {
-        return ZtLink::Unknown;
-    }
-    let port = std::fs::read_to_string(ctx.user_dir.join("zt.port"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(9993);
-    let resp = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .get(&format!("http://127.0.0.1:{port}/peer/{server_node}"))
-        .set("X-ZT1-Auth", token)
-        .call();
-    let Ok(resp) = resp else { return ZtLink::Unknown };
-    let Ok(body) = resp.into_string() else { return ZtLink::Unknown };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else { return ZtLink::Unknown };
-    let direct = v["paths"]
-        .as_array()
-        .map(|p| p.iter().any(|x| x["active"].as_bool().unwrap_or(false)))
-        .unwrap_or(false);
-    if direct {
-        ZtLink::Direct(v["latency"].as_i64().unwrap_or(-1))
-    } else {
-        ZtLink::Relay
+    // Номер сети начинается с адреса узла-контроллера (это и есть компьютер с сервером).
+    match crate::zt::peer_link(&ctx.zt_network[..10]) {
+        Some(Some(ms)) => ZtLink::Direct(ms),
+        Some(None) => ZtLink::Relay,
+        None => ZtLink::Unknown,
     }
 }
 
@@ -393,8 +421,8 @@ pub fn run(ctx: &Context) -> Report {
             rep.issues.push(issue(
                 Severity::Problem,
                 "Виртуальная сеть ZeroTier не подключена",
-                "Без неё не добраться до сервера. Нажмите «Исправить» — программа заново подключит сеть.",
-                Fix::ApplyTweaks,
+                "Без неё не добраться до сервера. Нажмите «Исправить» — программа заново подключит сеть (нужны права администратора).",
+                Fix::JoinZeroTier,
             ));
         } else if !local_server {
             match zt_link(ctx) {
@@ -455,25 +483,170 @@ pub fn run(ctx: &Context) -> Report {
                 ));
             }
         }
-    }
-    if ctx.runs_server && !ctx.server_running {
-        rep.issues.push(issue(
-            Severity::Problem,
-            "Сервер на этом компьютере не запущен",
-            "Друзья не смогут подключиться. Проверьте, что Mumble Server установлен, и перезапустите «Рацию».",
-            Fix::None,
-        ));
+    } else if matches!(ctx.status, crate::core::Status::Reconnecting(_)) && !local_server {
+        if let Some(i) = reachability(&ctx.server_host, ctx.server_port) {
+            rep.issues.push(i);
+        }
     }
 
-    // --- системные настройки ---
-    if !ctx.tweaks_applied {
-        rep.issues.push(issue(
-            Severity::Warning,
-            "Сетевые настройки Windows не применены",
-            "Приоритет голосового трафика и остальные настройки одинаковы у всех участников. Нажмите «Исправить» (потребуется разрешение администратора).",
-            Fix::ApplyTweaks,
-        ));
+    // --- сервер на этом компьютере ---
+    if ctx.runs_server {
+        server_checks(ctx, &mut rep);
     }
 
     rep
 }
+
+/// Почему не удаётся подключиться: сначала ping до компьютера, потом попытка открыть порт.
+fn reachability(host: &str, port: u16) -> Option<Issue> {
+    let addr: SocketAddr = (host, port).to_socket_addrs().ok()?.find(|a| a.is_ipv4())?;
+    let std::net::IpAddr::V4(ip) = addr.ip() else { return None };
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(3));
+    let refused = matches!(&tcp, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused);
+    if tcp.is_ok() {
+        return None;
+    }
+    let (_, answered) = icmp_ping(ip, 3);
+    Some(if refused {
+        issue(
+            Severity::Problem,
+            "На компьютере с сервером не запущен сервер",
+            format!("Компьютер {ip} в сети, но порт {port} никто не слушает. Попросите владельца запустить «Рацию» с включённым сервером."),
+            Fix::None,
+        )
+    } else if answered > 0 {
+        issue(
+            Severity::Problem,
+            "Порт сервера закрыт",
+            format!("Компьютер {ip} отвечает, но порт {port} не открывается — его закрывает брандмауэр на компьютере с сервером. Владельцу: «Сервер» → «Исправить»."),
+            Fix::None,
+        )
+    } else {
+        issue(
+            Severity::Problem,
+            "Компьютер с сервером не отвечает",
+            format!("{ip} не отвечает: компьютер с сервером выключен, без интернета, или (для ZeroTier) не в виртуальной сети. Программа подключится сама, как только он появится."),
+            Fix::None,
+        )
+    })
+}
+
+/// Медленные проверки (netsh, PowerShell) выполняются не чаще раза в 30 минут, если не попросили.
+struct SlowCache {
+    at: Option<Instant>,
+    port: u16,
+    port_state: Option<crate::server::ports::PortState>,
+    firewall: Option<Firewall>,
+}
+
+static SLOW: Mutex<SlowCache> = Mutex::new(SlowCache { at: None, port: 0, port_state: None, firewall: None });
+
+#[derive(Clone, Copy, Debug)]
+struct Firewall {
+    enabled: bool,
+    allows_port: bool,
+    blocks_app: bool,
+}
+
+fn firewall_state(port: u16) -> Option<Firewall> {
+    let script = format!(
+        "$ErrorActionPreference = 'SilentlyContinue'\n\
+         $on = ((Get-Service mpssvc).Status -eq 'Running') -and [bool](Get-NetFirewallProfile | Where-Object {{ $_.Enabled -eq 'True' }})\n\
+         $allow = $false; $block = $false\n\
+         if ($on) {{\n\
+           foreach ($f in (Get-NetFirewallPortFilter -Protocol TCP | Where-Object {{ $_.LocalPort -eq '{port}' }})) {{\n\
+             $r = $f | Get-NetFirewallRule\n\
+             if ($r.Enabled -eq 'True' -and $r.Direction -eq 'Inbound' -and $r.Action -eq 'Allow') {{ $allow = $true }}\n\
+           }}\n\
+           foreach ($f in (Get-NetFirewallApplicationFilter | Where-Object {{ $_.Program -like '*\\raciya.exe' }})) {{\n\
+             $r = $f | Get-NetFirewallRule\n\
+             if ($r.Enabled -eq 'True' -and $r.Direction -eq 'Inbound') {{ if ($r.Action -eq 'Block') {{ $block = $true }} else {{ $allow = $true }} }}\n\
+           }}\n\
+         }}\n\
+         \"fw=$on allow=$allow block=$block\"\n"
+    );
+    let (_, out) = crate::win::run_powershell(&script);
+    let flag = |name: &str| out.contains(&format!("{name}=True"));
+    out.contains("fw=").then(|| Firewall { enabled: flag("fw"), allows_port: flag("allow"), blocks_app: flag("block") })
+}
+
+fn server_checks(ctx: &Context, rep: &mut Report) {
+    if let Some((text, fixable)) = &ctx.server_error {
+        rep.issues.push(issue(
+            Severity::Problem,
+            "Сервер на этом компьютере не запущен",
+            capitalize(text),
+            if *fixable { Fix::ServerSetup } else { Fix::None },
+        ));
+        return;
+    }
+    if !ctx.server_running {
+        return;
+    }
+    let port = ctx.host_port;
+    // Правила сети ZeroTier (если сеть создана на этом компьютере) должны пропускать порт сервера.
+    if !ctx.zt_network.is_empty() {
+        if let Some(net) = crate::zt::get(&format!("/controller/network/{}", ctx.zt_network)) {
+            if !crate::zt::rules_allow_port(&net["rules"], port) {
+                rep.issues.push(issue(
+                    Severity::Problem,
+                    format!("Сеть ZeroTier не пропускает порт сервера {port}"),
+                    "Друзья через ZeroTier не подключатся. Нажмите «Исправить» — программа поменяет правила сети.",
+                    Fix::ZeroTierRules,
+                ));
+            }
+        }
+    }
+    let (port_state, firewall) = {
+        let mut c = SLOW.lock().unwrap();
+        let stale = ctx.force || c.port != port || c.at.map(|t| t.elapsed() > Duration::from_secs(1800)).unwrap_or(true);
+        if stale {
+            c.port = port;
+            c.port_state = Some(crate::server::ports::state(port));
+            c.firewall = firewall_state(port);
+            c.at = Some(Instant::now());
+        }
+        (c.port_state.clone(), c.firewall)
+    };
+    if let Some(fw) = firewall.filter(|f| f.enabled) {
+        if fw.blocks_app {
+            rep.issues.push(issue(
+                Severity::Problem,
+                "Брандмауэр Windows блокирует «Рацию»",
+                "Друзья не смогут подключиться к серверу. Нажмите «Исправить» — блокировка снимется (нужны права администратора).",
+                Fix::ServerSetup,
+            ));
+        } else if !fw.allows_port {
+            rep.issues.push(issue(
+                Severity::Problem,
+                format!("Брандмауэр не пропускает порт сервера {port}"),
+                "Друзья не смогут подключиться. Нажмите «Исправить» — программа добавит правило брандмауэра (нужны права администратора).",
+                Fix::ServerSetup,
+            ));
+        }
+    }
+    if let Some(ps) = port_state {
+        if ps.at_risk() {
+            rep.issues.push(issue(
+                Severity::Warning,
+                format!("Порт сервера {port} может пропасть после перезагрузки"),
+                "Hyper-V, WSL или Docker при каждом старте Windows занимают случайные порты из этого диапазона. Нажмите «Исправить» — порт закрепится за «Рацией» (нужны права администратора).",
+                Fix::ServerSetup,
+            ));
+        }
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Сбрасывает кэш медленных проверок (после системной настройки).
+pub fn invalidate_cache() {
+    SLOW.lock().unwrap().at = None;
+}
+

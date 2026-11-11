@@ -1,6 +1,10 @@
-//! Соединение с сервером Mumble: управляющий канал TLS/TCP и голосовой канал UDP (OCB2-AES128).
+//! Соединение с сервером: управляющий канал TLS/TCP и голосовой канал UDP (OCB2-AES128).
 //! Если UDP недоступен, голос идёт через TCP-туннель (запасной путь).
+//!
+//! Запись в TLS делает отдельный поток из очереди: звуковой поток и интерфейс никогда
+//! не ждут сеть. Голос через туннель при переполнении очереди просто отбрасывается.
 
+use crate::framing::{frame, frame_msg, Deframer};
 use crate::ocb2::CryptState;
 use crate::proto::*;
 use crate::varint::{read_varint, write_varint};
@@ -12,12 +16,9 @@ use rustls::{ClientConnection, DigitallySignedStruct, SignatureScheme};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// Версия протокола, которую объявляет клиент: 1.4.0 (сервер использует «классический»
-/// формат голосовых пакетов, одинаковый для UDP и TCP-туннеля).
-const PROTOCOL_VERSION: u32 = (1 << 16) | (4 << 8);
 
 pub enum LinkEvent {
     Synced { session: u32, welcome: String },
@@ -38,7 +39,7 @@ pub trait LinkHandler: Send + Sync + 'static {
 #[derive(Debug)]
 struct AcceptAnyCert(Arc<CryptoProvider>);
 
-/// Сервер Mumble использует самоподписанный сертификат, поэтому цепочка доверия не проверяется.
+/// Сервер использует самоподписанный сертификат, поэтому цепочка доверия не проверяется.
 /// Подписи рукопожатия проверяются как обычно; доступ к серверу защищён паролем.
 impl ServerCertVerifier for AcceptAnyCert {
     fn verify_server_cert(
@@ -79,11 +80,15 @@ pub struct Link {
     tls: Mutex<ClientConnection>,
     tcp: TcpStream,
     udp: UdpSocket,
+    /// Кадры для потока записи.
+    tx: SyncSender<Vec<u8>>,
     crypt: Mutex<Option<CryptState>>,
     handler: Arc<dyn LinkHandler>,
     alive: AtomicBool,
     closed_sent: AtomicBool,
     udp_ok: AtomicBool,
+    /// Для проверок: не пользоваться UDP вообще (как при закрытом брандмауэре).
+    udp_disabled: AtomicBool,
     last_udp_rx_ms: AtomicU64,
     last_resync_ms: AtomicU64,
     bad_udp: AtomicU32,
@@ -98,13 +103,16 @@ fn other(msg: impl Into<String>) -> io::Error {
 }
 
 fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
-    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| other(format!("адрес «{host}» не найден")))?
+        .collect();
     addrs
         .iter()
         .find(|a| a.is_ipv4())
         .or_else(|| addrs.first())
         .copied()
-        .ok_or_else(|| other("адрес сервера не найден"))
+        .ok_or_else(|| other(format!("адрес «{host}» не найден")))
 }
 
 impl Link {
@@ -146,15 +154,18 @@ impl Link {
             .map_err(|e| other(e.to_string()))?;
         let conn = ClientConnection::new(Arc::new(cfg), name).map_err(|e| other(e.to_string()))?;
 
+        let (tx, rx) = sync_channel::<Vec<u8>>(256);
         let link = Arc::new(Link {
             tls: Mutex::new(conn),
             tcp,
             udp,
+            tx,
             crypt: Mutex::new(None),
             handler,
             alive: AtomicBool::new(true),
             closed_sent: AtomicBool::new(false),
             udp_ok: AtomicBool::new(false),
+            udp_disabled: AtomicBool::new(false),
             last_udp_rx_ms: AtomicU64::new(0),
             last_resync_ms: AtomicU64::new(0),
             bad_udp: AtomicU32::new(0),
@@ -165,23 +176,24 @@ impl Link {
         });
 
         // Сообщения ставятся в очередь TLS и уйдут сразу после рукопожатия.
-        link.send_msg(
+        link.write_now(&frame_msg(
             T_VERSION,
             &Version {
                 version_v1: Some(PROTOCOL_VERSION),
                 release: Some(format!("Raciya {}", env!("CARGO_PKG_VERSION"))),
                 os: Some("Windows".into()),
                 os_version: None,
+                version_v2: None,
             },
-        )?;
-        link.send_msg(
+        ))?;
+        link.write_now(&frame_msg(
             T_AUTHENTICATE,
             &Authenticate {
                 username: Some(username.to_string()),
                 password: if password.is_empty() { None } else { Some(password.to_string()) },
                 opus: Some(true),
             },
-        )?;
+        ))?;
 
         let l = link.clone();
         std::thread::Builder::new()
@@ -193,6 +205,13 @@ impl Link {
                     Err(e) => describe_io(&e),
                 };
                 l.shutdown(reason);
+            })?;
+        let l = link.clone();
+        std::thread::Builder::new()
+            .name("net-tx".into())
+            .spawn(move || {
+                crate::win::set_thread_priority(crate::win::Prio::Low);
+                l.writer_loop(rx);
             })?;
         let l = link.clone();
         std::thread::Builder::new()
@@ -221,6 +240,14 @@ impl Link {
 
     pub fn session(&self) -> u32 {
         self.session.load(Ordering::Relaxed)
+    }
+
+    /// Для проверок: отключить UDP и пользоваться только TCP-туннелем.
+    pub fn set_udp_disabled(&self, on: bool) {
+        self.udp_disabled.store(on, Ordering::SeqCst);
+        if on {
+            self.udp_ok.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Счётчики принятых голосовых пакетов: (принято, опоздало, потеряно).
@@ -258,18 +285,42 @@ impl Link {
         Ok(())
     }
 
-    fn send_raw(&self, ty: u16, payload: &[u8]) -> io::Result<()> {
-        let mut frame = Vec::with_capacity(6 + payload.len());
-        frame.extend_from_slice(&ty.to_be_bytes());
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(payload);
+    /// Запись прямо из вызывающего потока — только до запуска рабочих потоков.
+    fn write_now(&self, data: &[u8]) -> io::Result<()> {
         let mut tls = self.tls.lock().unwrap();
-        tls.writer().write_all(&frame)?;
+        tls.writer().write_all(data)?;
         self.flush_locked(&mut tls)
     }
 
-    fn send_msg<M: Message>(&self, ty: u16, msg: &M) -> io::Result<()> {
-        self.send_raw(ty, &msg.encode_to_vec())
+    fn writer_loop(&self, rx: Receiver<Vec<u8>>) {
+        while self.is_alive() {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(f) => {
+                    let r = {
+                        let mut tls = self.tls.lock().unwrap();
+                        tls.writer().write_all(&f).and_then(|_| self.flush_locked(&mut tls))
+                    };
+                    if let Err(e) = r {
+                        self.shutdown(describe_io(&e));
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// Управляющее сообщение. Если очередь переполнена, сервер давно не принимает данные —
+    /// соединение считается оборванным (программа переподключится сама).
+    fn send_frame(&self, f: Vec<u8>) {
+        if let Err(TrySendError::Full(_)) = self.tx.try_send(f) {
+            self.shutdown("сервер не принимает данные".into());
+        }
+    }
+
+    fn send_msg<M: Message>(&self, ty: u16, msg: &M) {
+        self.send_frame(frame_msg(ty, msg));
     }
 
     /// Отправляет голосовой пакет (в открытом виде, классический формат):
@@ -278,7 +329,7 @@ impl Link {
         if !self.is_alive() || plain.len() > 1400 {
             return;
         }
-        if self.udp_ok.load(Ordering::Relaxed) {
+        if self.udp_ok.load(Ordering::Relaxed) && !self.udp_disabled.load(Ordering::Relaxed) {
             let mut out = [0u8; 1408];
             let n = {
                 let mut c = self.crypt.lock().unwrap();
@@ -295,7 +346,8 @@ impl Link {
                 return;
             }
         }
-        let _ = self.send_raw(T_UDPTUNNEL, plain);
+        // Туннель: при переполнении очереди пакет отбрасывается — голос не ждёт.
+        let _ = self.tx.try_send(frame(T_UDPTUNNEL, plain));
     }
 
     /// Сообщает серверу состояние «микрофон выключен / звук выключен».
@@ -304,7 +356,7 @@ impl Link {
         if session == 0 {
             return;
         }
-        let _ = self.send_msg(
+        self.send_msg(
             T_USERSTATE,
             &UserState {
                 session: Some(session),
@@ -317,7 +369,7 @@ impl Link {
 
     fn tcp_loop(self: &Arc<Self>) -> io::Result<()> {
         let mut raw = vec![0u8; 16 * 1024];
-        let mut plain: Vec<u8> = Vec::with_capacity(8 * 1024);
+        let mut frames = Deframer::new(8 * 1024 * 1024);
         let mut tmp = [0u8; 4096];
         let mut sock = &self.tcp;
         {
@@ -339,7 +391,7 @@ impl Link {
                     loop {
                         match tls.reader().read(&mut tmp) {
                             Ok(0) => return Err(other("сервер закрыл соединение")),
-                            Ok(k) => plain.extend_from_slice(&tmp[..k]),
+                            Ok(k) => frames.push(&tmp[..k]),
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(e) => return Err(e),
                         }
@@ -347,22 +399,13 @@ impl Link {
                 }
                 self.flush_locked(&mut tls)?;
             }
-
-            let mut off = 0usize;
-            while plain.len() - off >= 6 {
-                let ty = u16::from_be_bytes([plain[off], plain[off + 1]]);
-                let len =
-                    u32::from_be_bytes([plain[off + 2], plain[off + 3], plain[off + 4], plain[off + 5]]) as usize;
-                if len > 8 * 1024 * 1024 {
-                    return Err(other("слишком большое сообщение от сервера"));
+            loop {
+                match frames.next() {
+                    Ok(Some((ty, body))) => self.handle_msg(ty, body),
+                    Ok(None) => break,
+                    Err(_) => return Err(other("слишком большое сообщение от сервера")),
                 }
-                if plain.len() - off - 6 < len {
-                    break;
-                }
-                self.handle_msg(ty, &plain[off + 6..off + 6 + len]);
-                off += 6 + len;
             }
-            plain.drain(..off);
         }
         Ok(())
     }
@@ -441,7 +484,7 @@ impl Link {
                 // Сервер просит наш счётчик.
                 let iv = self.crypt.lock().unwrap().as_ref().map(|c| c.encrypt_iv());
                 if let Some(iv) = iv {
-                    let _ = self.send_msg(
+                    self.send_msg(
                         T_CRYPTSETUP,
                         &CryptSetup { key: None, client_nonce: Some(iv.to_vec()), server_nonce: None },
                     );
@@ -456,6 +499,9 @@ impl Link {
         while self.is_alive() {
             match self.udp.recv(&mut buf) {
                 Ok(n) if n > 4 => {
+                    if self.udp_disabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let ok = {
                         let mut c = self.crypt.lock().unwrap();
                         match c.as_mut() {
@@ -483,7 +529,7 @@ impl Link {
                         if bad >= 20 && now.saturating_sub(self.last_resync_ms.load(Ordering::Relaxed)) > 5000 {
                             self.last_resync_ms.store(now, Ordering::Relaxed);
                             self.bad_udp.store(0, Ordering::Relaxed);
-                            let _ = self.send_msg(T_CRYPTSETUP, &CryptSetup::default());
+                            self.send_msg(T_CRYPTSETUP, &CryptSetup::default());
                         }
                     }
                 }
@@ -529,6 +575,9 @@ impl Link {
     }
 
     fn send_udp_ping(&self) {
+        if self.udp_disabled.load(Ordering::Relaxed) {
+            return;
+        }
         let mut pkt = Vec::with_capacity(12);
         pkt.push(1u8 << 5);
         write_varint(&mut pkt, self.now_us());
@@ -563,11 +612,8 @@ impl Link {
             }
             // TCP ping: раз в 5 секунд (и чаще, пока по нему измеряется задержка).
             if tick % 5 == 0 || (!udp_ok && tick % 2 == 0) {
-                let (good, late, lost) = {
-                    let c = self.crypt.lock().unwrap();
-                    c.as_ref().map(|c| (c.good, c.late, c.lost)).unwrap_or((0, 0, 0))
-                };
-                let r = self.send_msg(
+                let (good, late, lost) = self.udp_stats();
+                self.send_msg(
                     T_PING,
                     &Ping {
                         timestamp: Some(self.now_us()),
@@ -577,10 +623,6 @@ impl Link {
                         resync: Some(0),
                     },
                 );
-                if let Err(e) = r {
-                    self.shutdown(describe_io(&e));
-                    return;
-                }
             }
             // UDP молчит дольше 7 секунд — переходим на TCP-туннель, продолжая пробовать UDP.
             if udp_ok && self.now_ms().saturating_sub(self.last_udp_rx_ms.load(Ordering::Relaxed)) > 7000 {
@@ -592,12 +634,21 @@ impl Link {
 }
 
 fn describe_io(e: &io::Error) -> String {
+    // Коды Windows Sockets: так точнее, чем по io::ErrorKind.
+    match e.raw_os_error() {
+        Some(10060) => return "сервер не отвечает — ПК с сервером выключен или порт закрыт брандмауэром".into(),
+        Some(10061) => return "на этом адресе сервер не запущен".into(),
+        Some(10051) | Some(10065) => return "нет пути до сервера — проверьте интернет (или ZeroTier)".into(),
+        Some(10054) | Some(10053) => return "соединение разорвано".into(),
+        _ => {}
+    }
     match e.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "сервер не отвечает".into(),
-        io::ErrorKind::ConnectionRefused => "сервер недоступен".into(),
+        io::ErrorKind::ConnectionRefused => "на этом адресе сервер не запущен".into(),
         io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe => {
             "соединение разорвано".into()
         }
+        io::ErrorKind::InvalidData => format!("ошибка защищённого соединения: {e}"),
         _ => e.to_string(),
     }
 }

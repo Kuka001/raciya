@@ -1,10 +1,17 @@
-//! Режим без окна для проверок и замеров:
+//! Режимы без окна.
+//!
+//! Клиент для проверок и замеров:
 //!   raciya.exe --headless --server 127.0.0.1:64738 --user test --password ... [--tone] [--talk MS:MS] [--seconds N]
 //!
 //!   --tone         вместо микрофона передаётся тон 440 Гц
 //!   --talk ON:OFF  имитировать нажатие «говорить»: ON мс говорить, OFF мс молчать
 //!   --vad          режим «по голосу»
+//!   --no-udp       не пользоваться UDP (проверка запасного TCP-канала)
 //!   --seconds N    завершиться через N секунд (по умолчанию 20)
+//!
+//! Только сервер (на отдельном компьютере или для проверок):
+//!   raciya.exe --server [--port N] [--password P] [--users N] [--welcome T] [--seconds N]
+//!   Без ключей берутся настройки сервера из config.toml. Журнал — %APPDATA%\Raciya\server\server.log.
 
 use crate::config::Config;
 use crate::core::{Core, Event, Status};
@@ -13,6 +20,52 @@ use std::time::{Duration, Instant};
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+pub fn run_server(args: &[String]) {
+    crate::log::init_server(crate::server::data_dir().join("server.log"));
+    let cfg = Config::load();
+    let mut settings = cfg.host().settings();
+    if let Some(p) = arg_value(args, "--port").and_then(|v| v.parse().ok()) {
+        settings.port = p;
+    }
+    if let Some(pw) = arg_value(args, "--password") {
+        settings.password = pw;
+    }
+    if let Some(n) = arg_value(args, "--users").and_then(|v| v.parse().ok()) {
+        settings.max_users = n;
+    }
+    if let Some(w) = arg_value(args, "--welcome") {
+        settings.welcome = w;
+    }
+    let seconds: Option<u64> = arg_value(args, "--seconds").and_then(|s| s.parse().ok());
+    let server = match crate::server::Server::start(settings, crate::server::data_dir(), Box::new(|| {})) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("server: {}", e.describe());
+            std::process::exit(1);
+        }
+    };
+    println!("server: listening on port {}, certificate {}", server.port(), server.fingerprint());
+    let t0 = Instant::now();
+    let mut last = String::new();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let users: Vec<String> = server
+            .users()
+            .iter()
+            .map(|u| format!("{}#{}@{}{}", u.name, u.session, u.addr, if u.udp { "" } else { "(tcp)" }))
+            .collect();
+        let line = users.join(", ");
+        if line != last {
+            println!("[server {:>6}] users: [{line}]", t0.elapsed().as_millis());
+            last = line;
+        }
+        if seconds.map(|s| t0.elapsed() >= Duration::from_secs(s)).unwrap_or(false) {
+            break;
+        }
+    }
+    server.stop();
 }
 
 pub fn run(args: &[String]) {
@@ -63,10 +116,12 @@ pub fn run(args: &[String]) {
                 Event::Notice(n) => println!("[{tag} {t:>6}] notice: {n}"),
                 Event::KeyCaptured(k) => println!("[{tag} {t:>6}] key captured: {k:?}"),
                 Event::Devices { input, output } => println!("[{tag} {t:>6}] devices: in='{input}' out='{output}'"),
+                Event::Server => {}
             }
         }),
     );
     core.audio.tone.store(tone, Ordering::Relaxed);
+    core.no_udp.store(args.iter().any(|a| a == "--no-udp"), Ordering::Relaxed);
     core.connect();
 
     let end = Instant::now() + Duration::from_secs(seconds);

@@ -23,6 +23,9 @@ const SPEAK_HOLD: u32 = 15;
 const PTT_TAIL: u32 = 6;
 /// Сколько кадров продолжаем передачу после падения громкости ниже порога (режим «по голосу»).
 const VAD_HANG: u32 = 35;
+/// С «сильным» шумоподавлением «по голосу» срабатывает, только если RNNoise слышит речь
+/// (вероятность выше порога): шум вентилятора и клавиатуры передачу не включают.
+const SPEECH_PROB: f32 = 0.4;
 
 pub enum AudioEvent {
     Speaking { session: u32, on: bool },
@@ -234,6 +237,8 @@ struct Capture {
     gate_floor: f32,
     gate_gain: f32,
     gate_hold: u32,
+    /// Вероятность речи в последнем кадре по оценке RNNoise (1.0 — оценки нет).
+    speech_prob: f32,
     packet: Vec<u8>,
     opus_buf: [u8; 1275],
     peak_hold: f32,
@@ -266,6 +271,7 @@ impl Capture {
             gate_floor: 0.0,
             gate_gain: 1.0,
             gate_hold: 0,
+            speech_prob: 1.0,
             packet: Vec::with_capacity(256),
             opus_buf: [0u8; 1275],
             peak_hold: 0.0,
@@ -339,12 +345,15 @@ impl Capture {
             for (i, s) in self.buf.iter().enumerate() {
                 input[i] = s * 32768.0;
             }
-            st.process_frame(&mut output, &input);
+            self.speech_prob = st.process_frame(&mut output, &input);
             for (i, s) in self.buf.iter_mut().enumerate() {
                 *s = output[i] / 32768.0;
             }
-        } else if self.denoise.is_some() {
-            self.denoise = None;
+        } else {
+            self.speech_prob = 1.0;
+            if self.denoise.is_some() {
+                self.denoise = None;
+            }
         }
         if noise_mode == 1 {
             self.noise_gate();
@@ -369,7 +378,7 @@ impl Capture {
 
         let want = if sh.vad_mode.load(Ordering::Relaxed) {
             let thr = f32::from_bits(sh.vad_threshold.load(Ordering::Relaxed));
-            if rms > thr {
+            if rms > thr && self.speech_prob >= SPEECH_PROB {
                 self.hang = VAD_HANG;
                 true
             } else if self.hang > 0 {

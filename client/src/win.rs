@@ -75,12 +75,30 @@ pub fn mark_voice_socket(sock: &UdpSocket) -> bool {
     }
 }
 
-/// Шифрует строку средствами Windows (DPAPI): расшифровать может только тот же пользователь Windows.
-pub fn protect(secret: &str) -> String {
-    if secret.is_empty() {
-        return String::new();
+/// Windows по умолчанию сообщает в `recv_from` об ICMP «порт недоступен» от прошлых отправок
+/// (WSAECONNRESET). Для сервера это шум: участник просто ушёл. Отключаем.
+pub fn disable_udp_connreset(sock: &UdpSocket) {
+    use windows_sys::Win32::Networking::WinSock::WSAIoctl;
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+    let flag: u32 = 0;
+    let mut returned = 0u32;
+    unsafe {
+        WSAIoctl(
+            sock.as_raw_socket() as usize,
+            SIO_UDP_CONNRESET,
+            &flag as *const u32 as *const std::ffi::c_void,
+            4,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        );
     }
-    let data = secret.as_bytes();
+}
+
+/// Шифрует данные средствами Windows (DPAPI): расшифровать может только тот же пользователь Windows.
+pub fn protect_bytes(data: &[u8]) -> Option<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
     let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
     unsafe {
@@ -94,26 +112,16 @@ pub fn protect(secret: &str) -> String {
             &mut out,
         );
         if ok == 0 || out.pbData.is_null() {
-            return String::new();
+            return None;
         }
-        let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize);
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
         LocalFree(out.pbData as _);
-        hex
+        Some(bytes)
     }
 }
 
-pub fn unprotect(hex: &str) -> String {
-    if hex.is_empty() || hex.len() % 2 != 0 {
-        return String::new();
-    }
-    let mut data = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        match u8::from_str_radix(&hex[i..i + 2], 16) {
-            Ok(b) => data.push(b),
-            Err(_) => return String::new(),
-        }
-    }
+pub fn unprotect_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    let mut data = data.to_vec();
     let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_mut_ptr() };
     let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
     unsafe {
@@ -127,13 +135,41 @@ pub fn unprotect(hex: &str) -> String {
             &mut out,
         );
         if ok == 0 || out.pbData.is_null() {
-            return String::new();
+            return None;
         }
-        let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize);
-        let s = String::from_utf8_lossy(bytes).into_owned();
+        let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
         LocalFree(out.pbData as _);
-        s
+        Some(bytes)
     }
+}
+
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn from_hex(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect()
+}
+
+/// Строка, зашифрованная DPAPI, в виде hex (так пароли лежат в config.toml).
+pub fn protect(secret: &str) -> String {
+    if secret.is_empty() {
+        return String::new();
+    }
+    protect_bytes(secret.as_bytes()).map(|b| to_hex(&b)).unwrap_or_default()
+}
+
+pub fn unprotect(hex: &str) -> String {
+    if hex.is_empty() {
+        return String::new();
+    }
+    from_hex(hex)
+        .and_then(|d| unprotect_bytes(&d))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
 }
 
 /// Нажата ли сейчас клавиша или кнопка мыши (работает и когда окно игры в фокусе).
@@ -447,13 +483,96 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
-/// Работает ли сейчас процесс с таким именем файла (без учёта регистра).
-pub fn process_running(exe_name: &str) -> bool {
-    let (_, out) = run_powershell(&format!(
-        "if (Get-Process -Name '{}' -ErrorAction SilentlyContinue) {{ 'yes' }} else {{ 'no' }}",
-        exe_name.trim_end_matches(".exe")
-    ));
-    out.contains("yes")
+/// Выполняет консольную программу без окна и возвращает её вывод (для `netsh` и т.п.).
+pub fn run_capture(exe: &str, args: &[&str]) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(exe)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Имя файла программы по номеру процесса (`mumble-server.exe` и т.п.).
+pub fn process_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        Some(path.rsplit('\\').next().unwrap_or(&path).to_string())
+    }
+}
+
+/// Какая программа слушает этот порт (TCP или UDP, IPv4). `None` — никто или не удалось узнать.
+pub fn port_owner(port: u16, udp: bool) -> Option<String> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCPROW_OWNER_PID, MIB_UDPROW_OWNER_PID,
+        TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    let mut size = 0u32;
+    let mut buf: Vec<u64> = Vec::new();
+    let mut ok = false;
+    for _ in 0..3 {
+        let r = unsafe {
+            if udp {
+                GetExtendedUdpTable(buf.as_mut_ptr() as _, &mut size, 0, AF_INET as u32, UDP_TABLE_OWNER_PID, 0)
+            } else {
+                GetExtendedTcpTable(buf.as_mut_ptr() as _, &mut size, 0, AF_INET as u32, TCP_TABLE_OWNER_PID_LISTENER, 0)
+            }
+        };
+        if r == 0 {
+            ok = !buf.is_empty();
+            break;
+        }
+        if r != 122 {
+            // Не ERROR_INSUFFICIENT_BUFFER.
+            return None;
+        }
+        buf = vec![0u64; size as usize / 8 + 1];
+    }
+    if !ok {
+        return None;
+    }
+    let base = buf.as_ptr() as *const u8;
+    let count = unsafe { *(base as *const u32) } as usize;
+    // Таблица: dwNumEntries, затем строки (выравнивание по 4 байта).
+    let rows = unsafe { base.add(4) };
+    for i in 0..count {
+        let (local_port, pid) = unsafe {
+            if udp {
+                let r = &*(rows as *const MIB_UDPROW_OWNER_PID).add(i);
+                (r.dwLocalPort, r.dwOwningPid)
+            } else {
+                let r = &*(rows as *const MIB_TCPROW_OWNER_PID).add(i);
+                (r.dwLocalPort, r.dwOwningPid)
+            }
+        };
+        // Порт хранится в сетевом порядке в младших 16 битах.
+        if u16::from_be(local_port as u16) == port {
+            return process_name(pid).or_else(|| Some(format!("процесс {pid}")));
+        }
+    }
+    None
 }
 
 /// Отключает Cloudflare WARP, если он установлен: через него друзья не могут подключиться напрямую,

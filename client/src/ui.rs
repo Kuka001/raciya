@@ -837,11 +837,16 @@ pub fn run(args: &[String]) {
     clog!("Рация {} запущена ({})", update::CURRENT, exe.display());
 
     let mut cfg = Config::load();
-    if cfg.migrate_legacy_server() {
+    let migrated = cfg.migrate_legacy_server();
+    if migrated {
         clog!("настройки сервера перенесены из Mumble Server (версия 0.2)");
         cfg.save();
     }
     system::cleanup_legacy();
+    // Сервер перешёл из Mumble Server в «Рацию»: один раз настраиваем брандмауэр и порт
+    // для неё самой — до запуска сервера, иначе Windows покажет свой запрос.
+    let host_port = cfg.host().port;
+    let setup_first = migrated && cfg.hosting() && system::server_setup_port() != Some(host_port);
     let complete = cfg.is_complete();
     let autoconnect = cfg.autoconnect && complete;
     let start_hidden = (cfg.start_minimized || has("--autostart")) && complete;
@@ -1184,6 +1189,13 @@ pub fn run(args: &[String]) {
         ui.fill_server_fields();
         ui.apply_server_view();
     });
+    if setup_first {
+        with_ui(|ui| ui.show_notice("настраиваю компьютер для сервера — Windows спросит разрешение".into()));
+        run_system_setup_then("server", Some(Box::new(|| core().apply_server_setting(8))));
+    } else {
+        // После обновления прежняя копия программы может ещё несколько секунд держать порт.
+        core().apply_server_setting(8);
+    }
     spawn_diag();
     spawn_update_checker();
     // Windows прячет новые значки в скрытую область; выносим свой на видное место.

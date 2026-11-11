@@ -172,10 +172,7 @@ impl Core {
                 no_udp: AtomicBool::new(false),
             }
         });
-        if persist {
-            // После обновления прежняя копия программы может ещё несколько секунд держать порт.
-            core.apply_server_setting(8);
-        }
+        // Сервер запускает интерфейс (`apply_server_setting`): иногда сначала нужна системная настройка.
 
         let (tx, _handle) = audio::spawn_audio(core.audio.clone(), core.devices.clone());
         *core.audio_tx.lock().unwrap() = Some(tx);

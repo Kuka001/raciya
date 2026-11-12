@@ -2,8 +2,9 @@
 //!
 //! Секрет (16 случайных байт) создаёт сервер; он попадает к друзьям только в коде приглашения.
 //! Из него выводятся:
-//! - `ih_srv` — ключ в DHT, под которым сервер публикует свой внешний адрес;
-//! - `ih_cli` — ключ, под которым клиенты сообщают свои адреса (сервер «стучится» им навстречу);
+//! - ключ подписи Ed25519 для записей в DHT (BEP 44): сервер публикует свой адрес, клиент —
+//!   просьбу «постучаться»; подложные записи отбрасываются по подписи;
+//! - `ih_srv` — запасной ключ, под которым сервер ещё и анонсирует адрес обычным `announce_peer`;
 //! - `k_auth` — ключ HMAC пакетов рукопожатия: без кода приглашения сервер не ответит вообще.
 //!
 //! Код приглашения: `raciya:<ключ>[;lan=адрес,...][;zt=сеть@адрес]`, где ключ — base32 от
@@ -11,16 +12,45 @@
 
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use std::net::SocketAddr;
 
 pub const PREFIX: &str = "raciya:";
 
 #[derive(Clone)]
 pub struct Room {
-    pub secret: [u8; 16],
     pub ih_srv: [u8; 20],
-    pub ih_cli: [u8; 20],
     k_auth: hmac::Key,
+    /// Ключ подписи записей в DHT (BEP 44): одинаковый у всех, кто знает код приглашения.
+    item_seed: [u8; 32],
+    pub item_public: [u8; 32],
+}
+
+/// Записи в DHT (BEP 44, изменяемые элементы): сервер публикует свой адрес, клиент — просьбу
+/// «постучаться» навстречу. Подписаны ключом комнаты: подложные записи отбрасываются.
+pub const SALT_SERVER: &[u8] = b"raciya-srv";
+pub const SALT_KNOCK: &[u8] = b"raciya-cli";
+
+/// Ключ записи в DHT: SHA-1(открытый ключ ‖ соль).
+pub fn item_target(public: &[u8; 32], salt: &[u8]) -> [u8; 20] {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    ctx.update(public);
+    ctx.update(salt);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(ctx.finish().as_ref());
+    out
+}
+
+/// Что подписывается по BEP 44: `4:salt<len>:<salt>3:seqi<seq>e1:v<bencode(v)>`.
+pub fn item_signable(salt: &[u8], seq: i64, v: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(32 + salt.len() + v.len());
+    if !salt.is_empty() {
+        m.extend_from_slice(format!("4:salt{}:", salt.len()).as_bytes());
+        m.extend_from_slice(salt);
+    }
+    m.extend_from_slice(format!("3:seqi{seq}e1:v").as_bytes());
+    m.extend_from_slice(v);
+    m
 }
 
 fn derive(secret: &[u8; 16], label: &str) -> [u8; 32] {
@@ -35,10 +65,30 @@ impl Room {
     pub fn new(secret: [u8; 16]) -> Room {
         let mut ih_srv = [0u8; 20];
         ih_srv.copy_from_slice(&derive(&secret, "raciya/dht-server/v1")[..20]);
-        let mut ih_cli = [0u8; 20];
-        ih_cli.copy_from_slice(&derive(&secret, "raciya/dht-clients/v1")[..20]);
         let k_auth = hmac::Key::new(hmac::HMAC_SHA256, &derive(&secret, "raciya/auth/v1"));
-        Room { secret, ih_srv, ih_cli, k_auth }
+        let item_seed = derive(&secret, "raciya/bep44/v1");
+        let kp = Ed25519KeyPair::from_seed_unchecked(&item_seed).expect("ed25519 seed");
+        let mut item_public = [0u8; 32];
+        item_public.copy_from_slice(kp.public_key().as_ref());
+        Room { ih_srv, k_auth, item_seed, item_public }
+    }
+
+    pub fn item_target(&self, salt: &[u8]) -> [u8; 20] {
+        item_target(&self.item_public, salt)
+    }
+
+    pub fn sign_item(&self, salt: &[u8], seq: i64, v: &[u8]) -> [u8; 64] {
+        let kp = Ed25519KeyPair::from_seed_unchecked(&self.item_seed).expect("ed25519 seed");
+        let sig = kp.sign(&item_signable(salt, seq, v));
+        let mut out = [0u8; 64];
+        out.copy_from_slice(sig.as_ref());
+        out
+    }
+
+    /// Подпись записи из DHT сделана ключом этой комнаты.
+    pub fn verify_item(&self, salt: &[u8], seq: i64, v: &[u8], k: &[u8], sig: &[u8]) -> bool {
+        k == self.item_public
+            && UnparsedPublicKey::new(&ED25519, &self.item_public).verify(&item_signable(salt, seq, v), sig).is_ok()
     }
 
     pub fn generate() -> [u8; 16] {
@@ -190,9 +240,23 @@ mod tests {
     }
 
     #[test]
+    fn signed_items() {
+        let r = Room::new([5; 16]);
+        let v = b"d1:e6:abcdefe";
+        let sig = r.sign_item(SALT_KNOCK, 42, v);
+        assert!(r.verify_item(SALT_KNOCK, 42, v, &r.item_public, &sig));
+        assert!(!r.verify_item(SALT_KNOCK, 43, v, &r.item_public, &sig));
+        assert!(!r.verify_item(SALT_SERVER, 42, v, &r.item_public, &sig));
+        assert!(!Room::new([6; 16]).verify_item(SALT_KNOCK, 42, v, &r.item_public, &sig));
+        assert_ne!(r.item_target(SALT_KNOCK), r.item_target(SALT_SERVER));
+        // Формат подписываемой строки — как в примере BEP 44.
+        assert_eq!(item_signable(b"foobar", 4, b"12:Hello World!"), b"4:salt6:foobar3:seqi4e1:v12:Hello World!".to_vec());
+    }
+
+    #[test]
     fn keys_differ_and_mac_checks() {
         let r = Room::new([1; 16]);
-        assert_ne!(r.ih_srv, r.ih_cli);
+        assert_ne!(r.ih_srv[..], r.item_target(SALT_SERVER)[..]);
         let m = r.mac(b"hello");
         assert!(r.check(b"hello", &m));
         assert!(!r.check(b"hellp", &m));

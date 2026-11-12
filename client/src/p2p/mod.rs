@@ -377,18 +377,25 @@ pub fn dial(
     progress(Stage::Searching);
     let found = Arc::new(AtomicUsize::new(0));
     if use_dht {
-        let e = ep.clone();
-        let target = room.ih_srv;
-        let f = found.clone();
         let deadline = Instant::now() + timeout;
+        let (e, f) = (ep.clone(), found.clone());
         let _ = std::thread::Builder::new().name("p2p-find".into()).spawn(move || {
-            // Поиск в DHT не всегда сходится с первого раза — повторяем, пока есть время
-            // (второй поиск начинается с уже найденных хороших узлов и идёт быстрее).
+            // Адрес сервера: сначала подписанная запись (подделать нельзя), иначе — announce_peer.
+            // Поиск в DHT не всегда сходится с первого раза — повторяем, пока есть время.
             while !e.stopped() && !e.established() && Instant::now() + Duration::from_secs(3) < deadline {
                 let left = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(10));
-                let l = e.dht.lookup(&target, left);
-                clog!("P2P: DHT ответили {} узлов, адресов сервера: {}", l.responded, l.peers.len());
+                let li = e.dht.lookup_with(dht::Query::Item, &e.room.item_target(room::SALT_SERVER), left);
                 e.dht.save_nodes();
+                if let Some((_, addr)) = verified_record(&e.room, room::SALT_SERVER, &li.items) {
+                    clog!("P2P: адрес сервера из подписанной записи: {addr}");
+                    f.store(e.add_candidates(&[(addr, usize::MAX)]), Ordering::SeqCst);
+                    break;
+                }
+                if e.established() {
+                    break;
+                }
+                let l = e.dht.lookup(&e.room.ih_srv, left);
+                clog!("P2P: подписанной записи нет; DHT ответили {} узлов, адресов сервера: {}", l.responded, l.peers.len());
                 if !l.peers.is_empty() {
                     f.store(e.add_candidates(&l.peers), Ordering::SeqCst);
                     break;
@@ -396,15 +403,27 @@ pub fn dial(
             }
         });
         let e = ep.clone();
-        let target = room.ih_cli;
         let _ = std::thread::Builder::new().name("p2p-knock".into()).spawn(move || {
-            // Сообщаем свой адрес: сервер увидит его и «постучится» навстречу.
-            let l = e.dht.lookup(&target, Duration::from_secs(10));
-            if e.established() {
-                return;
+            // Просьба «постучаться»: подписанная запись с нашим внешним адресом. Сервер увидит её
+            // и откроет свой NAT навстречу. Повторяем, пока не соединились.
+            let target = e.room.item_target(room::SALT_KNOCK);
+            while !e.stopped() && !e.established() && Instant::now() + Duration::from_secs(2) < deadline {
+                let lk = e.dht.lookup_with(dht::Query::Item, &target, Duration::from_secs(10));
+                if e.established() {
+                    return;
+                }
+                let Some(me) = lk.my_address().or_else(|| e.stun(stun::SERVERS[0], Duration::from_millis(1500))) else {
+                    continue;
+                };
+                let ok = publish_record(&e, room::SALT_KNOCK, &lk, me);
+                clog!("P2P: просьба постучаться опубликована у {ok} узлов (мой адрес {me})");
+                for _ in 0..40 {
+                    if e.established() || e.stopped() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
-            let ok = e.dht.announce(&target, &l.closest, e.local_port());
-            clog!("P2P: свой адрес опубликован у {ok} узлов");
         });
     }
     let started = Instant::now();
@@ -522,53 +541,91 @@ impl Drop for Host {
     }
 }
 
-/// Фоновая работа сервера в DHT: публикация адреса и «стук» навстречу новым клиентам.
+fn compact(addr: SocketAddr) -> Option<[u8; 6]> {
+    let SocketAddr::V4(a) = addr else { return None };
+    let mut b = [0u8; 6];
+    b[..4].copy_from_slice(&a.ip().octets());
+    b[4..].copy_from_slice(&a.port().to_be_bytes());
+    Some(b)
+}
+
+/// Самая свежая запись с верной подписью комнаты: (номер, адрес из неё).
+fn verified_record(room: &Room, salt: &[u8], items: &[dht::Item]) -> Option<(i64, SocketAddr)> {
+    items
+        .iter()
+        .filter(|it| room.verify_item(salt, it.seq, &it.v, &it.k, &it.sig))
+        .filter_map(|it| {
+            let v = bencode::decode(&it.v)?;
+            let addr = v.get("e").and_then(|x| x.as_bytes()).and_then(dht::compact_addr)?;
+            Some((it.seq, addr))
+        })
+        .max_by_key(|(seq, _)| *seq)
+}
+
+/// Публикует подписанную запись «я по адресу `me`» у ближайших узлов из поиска `l`.
+/// Номер записи — время в миллисекундах, но больше любого уже лежащего в сети
+/// (часы у друзей могут расходиться, а узлы принимают только записи с бо́льшим номером).
+fn publish_record(ep: &Endpoint, salt: &[u8], l: &dht::Lookup, me: SocketAddr) -> usize {
+    let Some(e) = compact(me) else { return 0 };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let newest = l.items.iter().map(|it| it.seq).max().unwrap_or(0);
+    let seq = now_ms.max(newest + 1);
+    let v = bencode::B::dict(vec![("e", bencode::B::bytes(e))]);
+    let sig = ep.room.sign_item(salt, seq, &v.encode());
+    ep.dht.put_item(&l.closest, &ep.room.item_public, salt, seq, &v, &sig)
+}
+
+/// Фоновая работа сервера в DHT: публикация своего адреса и «стук» навстречу клиентам,
+/// которые оставили подписанную просьбу.
 fn announcer(ep: Arc<Endpoint>, status: Arc<Mutex<HostStatus>>, on_status: Notify) {
     let Role::Server { last_flow, .. } = &ep.role else { return };
     let room = ep.room.clone();
     let port = ep.local_port();
+    let knock_target = room.item_target(room::SALT_KNOCK);
     let mut next_full = Instant::now();
-    let mut next_clients = Instant::now();
-    let mut clients_nodes: Vec<(dht::Node, Vec<u8>)> = Vec::new();
-    let mut knocked: HashMap<SocketAddr, Knock> = HashMap::new();
+    let mut next_knock_nodes = Instant::now();
+    let mut knock_nodes: Vec<(dht::Node, Vec<u8>)> = Vec::new();
+    let mut last_knock_seq = i64::MIN;
     let started = Instant::now();
     while !ep.stopped() {
-        // Ближайшие узлы для ключа клиентов пересматриваем чаще: клиент мог опубликовать адрес
-        // у немного других узлов.
-        if Instant::now() >= next_clients && Instant::now() < next_full {
-            let lc = ep.dht.lookup(&room.ih_cli, Duration::from_secs(10));
-            if !lc.closest.is_empty() {
-                clients_nodes = lc.closest;
-            }
-            next_clients = Instant::now() + Duration::from_secs(if clients_nodes.is_empty() { 60 } else { 120 });
-            knock(&ep, lc.reports.clone(), &mut knocked);
-        }
         if Instant::now() >= next_full {
+            // Свой адрес: announce_peer (узел сам запишет внешний адрес) и подписанная запись.
             let l = ep.dht.lookup(&room.ih_srv, Duration::from_secs(10));
             let announced = ep.dht.announce(&room.ih_srv, &l.closest, port);
-            let lc = ep.dht.lookup(&room.ih_cli, Duration::from_secs(10));
-            clients_nodes = lc.closest;
-            next_clients = Instant::now() + Duration::from_secs(120);
+            let li = ep.dht.lookup_with(dht::Query::Item, &room.item_target(room::SALT_SERVER), Duration::from_secs(10));
+            let me = l.my_address().or_else(|| li.my_address());
+            let signed = me.map(|m| publish_record(&ep, room::SALT_SERVER, &li, m)).unwrap_or(0);
             ep.dht.save_nodes();
             {
                 let mut st = status.lock().unwrap();
                 st.attempted = true;
-                st.announced = announced;
-                st.external = l.external.first().copied().or(st.external);
-                let ports: Vec<u16> = l.external.iter().map(|a| a.port()).collect();
+                st.announced = announced.max(signed);
+                st.external = me.or(st.external);
+                let ports: Vec<u16> = l.external.iter().chain(li.external.iter()).map(|a| a.port()).collect();
                 if ports.len() >= 2 {
                     st.stable_port = Some(ports.iter().all(|&p| p == ports[0]));
                 }
             }
             slog!(
-                "P2P: адрес опубликован у {announced} узлов DHT (ответили {}), внешний адрес {:?}",
+                "P2P: адрес опубликован: подписанная запись у {signed} узлов, announce у {announced} (ответили {}), внешний адрес {:?}",
                 l.responded,
-                l.external.first()
+                me
             );
             on_status();
             // Если DHT недоступна — пробуем снова через минуту, иначе раз в 10 минут.
-            next_full = Instant::now() + Duration::from_secs(if announced > 0 { 600 } else { 60 });
-            knock(&ep, lc.reports.clone(), &mut knocked);
+            next_full = Instant::now() + Duration::from_secs(if announced.max(signed) > 0 { 600 } else { 60 });
+        }
+        if Instant::now() >= next_knock_nodes {
+            // Узлы, у которых клиенты оставляют просьбы «постучаться».
+            let lk = ep.dht.lookup_with(dht::Query::Item, &knock_target, Duration::from_secs(10));
+            if !lk.closest.is_empty() {
+                knock_nodes = lk.closest.clone();
+            }
+            next_knock_nodes = Instant::now() + Duration::from_secs(if knock_nodes.is_empty() { 60 } else { 120 });
+            knock_new(&ep, &room, &lk.items, &mut last_knock_seq);
         }
         // Пока недавно кто-то подключался (или сервер только что запущен) — опрашиваем чаще.
         let since_flow = ep.clock.elapsed().as_secs().saturating_sub(last_flow.load(Ordering::Relaxed));
@@ -580,53 +637,25 @@ fn announcer(ep: Arc<Endpoint>, status: Arc<Mutex<HostStatus>>, on_status: Notif
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        if !clients_nodes.is_empty() {
-            let peers = ep.dht.poll(&room.ih_cli, &clients_nodes);
-            knock(&ep, peers, &mut knocked);
+        if !knock_nodes.is_empty() {
+            let items = ep.dht.poll_items(&knock_target, &knock_nodes);
+            knock_new(&ep, &room, &items, &mut last_knock_seq);
         }
     }
 }
 
-/// Что известно об адресе, который появился под ключом клиентов.
-struct Knock {
-    first: Instant,
-    last: Option<Instant>,
-    /// Узлы DHT, которые сообщили этот адрес.
-    reporters: std::collections::HashSet<SocketAddr>,
-}
-
-/// «Стук» навстречу клиентам: несколько пакетов открывают наш NAT для их адресов.
-/// Только по адресам, которые подтвердили хотя бы два узла DHT (бывают узлы, отвечающие
-/// подложными адресами — слать пакеты наугад чужим компьютерам нельзя), каждому — не чаще
-/// раза в 30 с и только первые 3 минуты после появления, не больше 4 новых адресов за раз.
-fn knock(ep: &Endpoint, reports: Vec<(SocketAddr, SocketAddr)>, knocked: &mut HashMap<SocketAddr, Knock>) {
-    let now = Instant::now();
-    knocked.retain(|_, k| now.duration_since(k.first) < Duration::from_secs(1800));
-    for (p, node) in reports {
-        knocked
-            .entry(p)
-            .or_insert_with(|| Knock { first: now, last: None, reporters: Default::default() })
-            .reporters
-            .insert(node);
+/// «Стук» навстречу клиенту из свежей подписанной просьбы: несколько пакетов открывают наш NAT
+/// для его адреса. Подложные записи отбрасываются проверкой подписи — пакеты чужим не уходят.
+fn knock_new(ep: &Endpoint, room: &Room, items: &[dht::Item], last_seq: &mut i64) {
+    let Some((seq, addr)) = verified_record(room, room::SALT_KNOCK, items) else { return };
+    if seq <= *last_seq {
+        return;
     }
-    let mut new_ones = 0;
-    for (p, k) in knocked.iter_mut() {
-        let fresh = now.duration_since(k.first) < Duration::from_secs(180);
-        let due = k.last.map(|t| now.duration_since(t) > Duration::from_secs(30)).unwrap_or(true);
-        if !fresh || !due || k.reporters.len() < 2 {
-            continue;
-        }
-        if k.last.is_none() {
-            if new_ones >= 4 {
-                continue;
-            }
-            new_ones += 1;
-            slog!("P2P: клиент {p} ищет сервер — стучусь навстречу");
-        }
-        k.last = Some(now);
-        for _ in 0..3 {
-            let _ = ep.sock.send_to(&ep.punch(), *p);
-        }
+    let first = *last_seq == i64::MIN;
+    *last_seq = seq;
+    slog!("P2P: клиент {addr} просит соединения{} — стучусь навстречу", if first { " (запись могла остаться с прошлого раза)" } else { "" });
+    for _ in 0..3 {
+        let _ = ep.sock.send_to(&ep.punch(), addr);
     }
 }
 
@@ -659,35 +688,36 @@ pub fn selftest() {
             return;
         }
     };
+    let target = room.item_target(room::SALT_SERVER);
     let t0 = Instant::now();
-    let l = host.ep.dht.lookup(&room.ih_srv, Duration::from_secs(10));
+    let l = host.ep.dht.lookup_with(dht::Query::Item, &target, Duration::from_secs(10));
     println!(
         "  DHT: ответили {} узлов за {} мс, ближайших с токеном: {}, внешний адрес по DHT: {:?}",
         l.responded,
         t0.elapsed().as_millis(),
         l.closest.len(),
-        l.external.first()
+        l.my_address()
     );
-    let ok = host.ep.dht.announce(&room.ih_srv, &l.closest, host.port());
-    println!("  DHT: адрес опубликован у {ok} узлов");
+    let Some(me) = l.my_address() else {
+        println!("  DHT: узлы не сообщили внешний адрес — публиковать нечего");
+        return;
+    };
+    let ok = publish_record(&host.ep, room::SALT_SERVER, &l, me);
+    println!("  DHT: подписанная запись (BEP 44) принята {ok} узлами");
     std::thread::sleep(Duration::from_secs(2));
-    // Второй сокет ищет опубликованный адрес — так же, как это сделает друг.
+    // Второй сокет ищет запись — так же, как это сделает друг — и проверяет подпись.
     let probe = Host::start(Room::new(Room::generate()), 0, false, Box::new(|_| {})).expect("socket");
     let t1 = Instant::now();
-    let found = probe.ep.dht.lookup(&room.ih_srv, Duration::from_secs(10));
-    let found_addrs: Vec<String> = found.peers.iter().map(|(a, n)| format!("{a} (узлов: {n})")).collect();
+    let found = probe.ep.dht.lookup_with(dht::Query::Item, &target, Duration::from_secs(10));
+    let verified = verified_record(&room, room::SALT_SERVER, &found.items);
     println!(
-        "  DHT: поиск комнаты {} мс, ответили {} узлов, найдено адресов: {} {:?}",
+        "  DHT: поиск записи {} мс, записей: {}, с верной подписью: {:?}",
         t1.elapsed().as_millis(),
-        found.responded,
-        found.peers.len(),
-        found_addrs
+        found.items.len(),
+        verified
     );
-    let same = found.closest.iter().filter(|(n, _)| l.closest.iter().any(|(m, _)| m.addr == n.addr)).count();
-    println!("  DHT: общих ближайших узлов у двух поисков: {same} из {}", l.closest.len());
-    // Прямой вопрос тем самым узлам, у которых опубликован адрес.
-    let direct = probe.ep.dht.poll(&room.ih_srv, &l.closest);
-    println!("  DHT: узлы, где опубликован адрес, отвечают: {direct:?}");
+    let fake = verified_record(&Room::new(Room::generate()), room::SALT_SERVER, &found.items);
+    println!("  DHT: с чужим ключом запись не принимается: {}", fake.is_none());
     host.ep.dht.save_nodes();
 }
 

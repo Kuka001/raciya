@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const K: usize = 8;
-const ALPHA: usize = 4;
-const QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
+const ALPHA: usize = 8;
+const QUERY_TIMEOUT: Duration = Duration::from_millis(1000);
 
 const BOOTSTRAP: [&str; 5] = [
     "router.bittorrent.com:6881",
@@ -45,6 +45,25 @@ pub struct Reply {
     pub values: Vec<SocketAddr>,
     /// Наш внешний адрес, как его видит узел (BEP 42).
     pub ip: Option<SocketAddr>,
+    /// Изменяемая запись (BEP 44), если узел её хранит.
+    pub item: Option<Item>,
+}
+
+/// Изменяемая запись BEP 44 в том виде, как её вернул узел (подпись проверяет вызывающий).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Item {
+    pub k: Vec<u8>,
+    pub sig: Vec<u8>,
+    pub seq: i64,
+    /// Значение в bencode (ровно те байты, что подписаны).
+    pub v: Vec<u8>,
+}
+
+/// Что ищем: адреса под ключом (`get_peers`) или запись BEP 44 (`get`).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Query {
+    Peers,
+    Item,
 }
 
 #[derive(Debug, Default)]
@@ -52,13 +71,24 @@ pub struct Lookup {
     /// Адреса под ключом и сколько разных узлов их сообщили. В DHT встречаются узлы,
     /// которые отвечают подложными адресами, поэтому доверять стоит подтверждённым (≥ 2).
     pub peers: Vec<(SocketAddr, usize)>,
-    /// Те же сведения подробно: (адрес, узел, который его сообщил).
-    pub reports: Vec<(SocketAddr, SocketAddr)>,
     /// Ближайшие ответившие узлы с токенами (для `announce` и `poll`).
     pub closest: Vec<(Node, Vec<u8>)>,
     /// Наш внешний адрес по ответам узлов (если узлы его сообщили).
     pub external: Vec<SocketAddr>,
     pub responded: usize,
+    /// Записи BEP 44, которые вернули узлы (без проверки подписи).
+    pub items: Vec<Item>,
+}
+
+impl Lookup {
+    /// Самый частый внешний адрес по ответам узлов.
+    pub fn my_address(&self) -> Option<SocketAddr> {
+        let mut counts: HashMap<SocketAddr, usize> = HashMap::new();
+        for a in &self.external {
+            *counts.entry(*a).or_insert(0) += 1;
+        }
+        counts.into_iter().max_by_key(|(_, n)| *n).map(|(a, _)| a)
+    }
 }
 
 pub struct Dht {
@@ -161,6 +191,15 @@ impl Dht {
             if let Some(vals) = r.get("values").and_then(|x| x.as_list()) {
                 reply.values = vals.iter().filter_map(|x| x.as_bytes().and_then(compact_addr)).collect();
             }
+            if let (Some(v), Some(k), Some(sig), Some(seq)) = (
+                r.get("v"),
+                r.get("k").and_then(|x| x.as_bytes()),
+                r.get("sig").and_then(|x| x.as_bytes()),
+                r.get("seq").and_then(|x| x.as_int()),
+            ) {
+                // Узлы хранят значение в каноническом bencode — повторное кодирование даёт те же байты.
+                reply.item = Some(Item { k: k.to_vec(), sig: sig.to_vec(), seq, v: v.encode() });
+            }
             let mut good = self.good.lock().unwrap();
             if !good.contains(&from) {
                 good.insert(0, from);
@@ -194,8 +233,24 @@ impl Dht {
         self.query(to, "get_peers", vec![("info_hash", B::bytes(*target))], tx);
     }
 
-    /// Итеративный поиск: спрашиваем всё более близкие к ключу узлы, пока ближайшие K не ответят.
+    fn get_item(&self, to: SocketAddr, target: &[u8; 20], tx: &Sender<Reply>) {
+        self.query(to, "get", vec![("target", B::bytes(*target))], tx);
+    }
+
+    fn ask(&self, kind: Query, to: SocketAddr, target: &[u8; 20], tx: &Sender<Reply>) {
+        match kind {
+            Query::Peers => self.get_peers(to, target, tx),
+            Query::Item => self.get_item(to, target, tx),
+        }
+    }
+
+    /// Итеративный поиск адресов под ключом.
     pub fn lookup(&self, target: &[u8; 20], timeout: Duration) -> Lookup {
+        self.lookup_with(Query::Peers, target, timeout)
+    }
+
+    /// Итеративный поиск: спрашиваем всё более близкие к ключу узлы, пока ближайшие K не ответят.
+    pub fn lookup_with(&self, kind: Query, target: &[u8; 20], timeout: Duration) -> Lookup {
         #[derive(PartialEq)]
         enum St {
             Fresh,
@@ -215,21 +270,24 @@ impl Dht {
             self.bootstrap().into_iter().map(|addr| C { addr, id: None, st: St::Fresh, token: None }).collect();
         let mut peers: HashMap<SocketAddr, HashSet<SocketAddr>> = HashMap::new();
         let mut external = Vec::new();
+        let mut items: Vec<Item> = Vec::new();
         let mut responded = 0usize;
         let mut inflight = 0usize;
         let key = |c: &C| c.id.map(|id| distance(&id, target)).unwrap_or([0xFF; 20]);
         loop {
             cands.sort_by_key(|c| key(c));
-            // Готово, когда K ближайших из известных (кроме не ответивших) ответили.
+            // Готово, когда среди K ближайших известных узлов нет неопрошенных, а ответили хотя бы K-2
+            // (часть узлов DHT просто молчит — ждать их до конца незачем).
             let top: Vec<&C> = cands.iter().filter(|c| c.st != St::Failed && c.id.is_some()).take(K).collect();
-            if top.len() >= K && top.iter().all(|c| c.st == St::Done) {
+            let done = top.iter().filter(|c| c.st == St::Done).count();
+            if top.len() >= K && done >= K - 2 && !top.iter().any(|c| c.st == St::Fresh) {
                 break;
             }
             for c in cands.iter_mut().filter(|c| c.st == St::Fresh) {
                 if inflight >= ALPHA {
                     break;
                 }
-                self.get_peers(c.addr, target, &tx);
+                self.ask(kind, c.addr, target, &tx);
                 c.st = St::Asked(Instant::now());
                 inflight += 1;
             }
@@ -250,6 +308,11 @@ impl Dht {
                     if let Some(ip) = r.ip {
                         external.push(ip);
                     }
+                    if let Some(it) = r.item {
+                        if !items.contains(&it) {
+                            items.push(it);
+                        }
+                    }
                     for v in r.values {
                         peers.entry(v).or_default().insert(from);
                     }
@@ -259,29 +322,52 @@ impl Dht {
                         }
                     }
                 }
-                Err(_) => {
-                    for c in cands.iter_mut() {
-                        if let St::Asked(at) = c.st {
-                            if at.elapsed() > QUERY_TIMEOUT {
-                                c.st = St::Failed;
-                                inflight -= 1;
-                            }
-                        }
+                Err(_) => {}
+            }
+            // Не ответившие вовремя освобождают место для следующих запросов — на каждом шаге,
+            // а не только когда ответы перестали приходить.
+            for c in cands.iter_mut() {
+                if let St::Asked(at) = c.st {
+                    if at.elapsed() > QUERY_TIMEOUT {
+                        c.st = St::Failed;
+                        inflight -= 1;
                     }
                 }
             }
         }
         cands.sort_by_key(|c| key(c));
+        if crate::win::trace_level() > 0 {
+            let count = |f: &dyn Fn(&St) -> bool| cands.iter().filter(|c| f(&c.st)).count();
+            let top: Vec<String> = cands
+                .iter()
+                .filter(|c| c.id.is_some() && c.st != St::Failed)
+                .take(K)
+                .map(|c| match c.st {
+                    St::Fresh => "F",
+                    St::Asked(_) => "A",
+                    St::Done => "D",
+                    St::Failed => "X",
+                }.to_string())
+                .collect();
+            eprintln!(
+                "dht lookup: cands={} fresh={} asked={} done={} failed={} inflight={inflight} top={}",
+                cands.len(),
+                count(&|s| *s == St::Fresh),
+                count(&|s| matches!(s, St::Asked(_))),
+                count(&|s| *s == St::Done),
+                count(&|s| *s == St::Failed),
+                top.join("")
+            );
+        }
         let closest = cands
             .iter()
             .filter(|c| c.st == St::Done)
             .filter_map(|c| Some((Node { id: c.id?, addr: c.addr }, c.token.clone()?)))
             .take(K)
             .collect();
-        let reports = peers.iter().flat_map(|(a, s)| s.iter().map(move |n| (*a, *n))).collect();
         let mut peers: Vec<(SocketAddr, usize)> = peers.into_iter().map(|(a, s)| (a, s.len())).collect();
         peers.sort_by(|a, b| b.1.cmp(&a.1));
-        Lookup { peers, reports, closest, external, responded }
+        Lookup { peers, closest, external, responded, items }
     }
 
     /// Публикует наш адрес под ключом у ближайших узлов. Возвращает, сколько узлов подтвердили.
@@ -311,6 +397,68 @@ impl Dht {
             }
         }
         ok
+    }
+
+    /// Сохраняет подписанную запись BEP 44 у ближайших узлов (токены — из ответов на `get`).
+    /// Возвращает, сколько узлов приняли запись.
+    pub fn put_item(&self, closest: &[(Node, Vec<u8>)], k: &[u8; 32], salt: &[u8], seq: i64, v: &B, sig: &[u8; 64]) -> usize {
+        let (tx, rx) = channel();
+        for (n, token) in closest {
+            self.query(
+                n.addr,
+                "put",
+                vec![
+                    ("token", B::bytes(token.clone())),
+                    ("v", v.clone()),
+                    ("k", B::bytes(*k)),
+                    ("sig", B::bytes(*sig)),
+                    ("seq", B::Int(seq)),
+                    ("salt", B::bytes(salt)),
+                ],
+                &tx,
+            );
+        }
+        let deadline = Instant::now() + QUERY_TIMEOUT;
+        let mut ok = 0;
+        let mut answered = 0;
+        while answered < closest.len() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(r) => {
+                    answered += 1;
+                    if r.id.is_some() {
+                        ok += 1;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        ok
+    }
+
+    /// Быстрый опрос известных узлов: какие записи BEP 44 у них сейчас лежат под ключом.
+    pub fn poll_items(&self, target: &[u8; 20], nodes: &[(Node, Vec<u8>)]) -> Vec<Item> {
+        let (tx, rx) = channel();
+        for (n, _) in nodes {
+            self.get_item(n.addr, target, &tx);
+        }
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        let (mut got, mut out) = (0, Vec::new());
+        while got < nodes.len() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(r) => {
+                    got += 1;
+                    if let Some(it) = r.item {
+                        if !out.contains(&it) {
+                            out.push(it);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        out
     }
 
     /// Быстрый опрос известных ближайших узлов: какие адреса сейчас записаны под ключом

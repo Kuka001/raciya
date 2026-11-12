@@ -19,6 +19,10 @@ pub struct HostConfig {
     pub max_users: u32,
     pub welcome: String,
     pub name: String,
+    /// Сервер перенесён из версии 0.2: перед первым запуском нужна системная настройка
+    /// (брандмауэр и закрепление порта для самой «Рации»). Сбрасывается после неё.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub setup_pending: bool,
     #[serde(skip)]
     pub password: String,
 }
@@ -32,6 +36,7 @@ impl Default for HostConfig {
             max_users: crate::server::DEFAULT_MAX_USERS,
             welcome: String::new(),
             name: "Рация".into(),
+            setup_pending: false,
             password: String::new(),
         }
     }
@@ -209,7 +214,7 @@ impl Config {
         if self.host.is_some() || !self.run_server {
             return false;
         }
-        let mut host = HostConfig { enabled: true, ..Default::default() };
+        let mut host = HostConfig { enabled: true, setup_pending: true, ..Default::default() };
         let ini = crate::server::data_dir().join("mumble-server.ini");
         if let Some(i) = crate::server::migrate::read_mumble_ini(&ini) {
             if let Some(p) = i.port.filter(|&p| p != 0) {
@@ -280,5 +285,11 @@ mod tests {
         let back: Config = toml::from_str(&out).unwrap();
         assert!(back.hosting());
         assert_eq!(back.host().port, DEFAULT_PORT);
+        assert!(!out.contains("setup_pending"));
+        // Признак незавершённой настройки переживает сохранение (установщик → программа).
+        let mut pending = back.clone();
+        pending.host.as_mut().unwrap().setup_pending = true;
+        let again: Config = toml::from_str(&toml::to_string_pretty(&pending).unwrap()).unwrap();
+        assert!(again.host().setup_pending);
     }
 }

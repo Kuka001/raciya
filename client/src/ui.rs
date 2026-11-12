@@ -846,7 +846,8 @@ pub fn run(args: &[String]) {
     // Сервер перешёл из Mumble Server в «Рацию»: один раз настраиваем брандмауэр и порт
     // для неё самой — до запуска сервера, иначе Windows покажет свой запрос.
     let host_port = cfg.host().port;
-    let setup_first = migrated && cfg.hosting() && system::server_setup_port() != Some(host_port);
+    let setup_first =
+        cfg.hosting() && cfg.host().setup_pending && system::server_setup_port() != Some(host_port);
     let complete = cfg.is_complete();
     let autoconnect = cfg.autoconnect && complete;
     let start_hidden = (cfg.start_minimized || has("--autostart")) && complete;
@@ -1191,7 +1192,18 @@ pub fn run(args: &[String]) {
     });
     if setup_first {
         with_ui(|ui| ui.show_notice("настраиваю компьютер для сервера — Windows спросит разрешение".into()));
-        run_system_setup_then("server", Some(Box::new(|| core().apply_server_setting(8))));
+        run_system_setup_then(
+            "server",
+            Some(Box::new(|| {
+                // Один раз: если пользователь отказал, дальше поможет «Исправить» в проверке сети.
+                if let Some(h) = core().cfg.lock().unwrap().host.as_mut() {
+                    h.setup_pending = false;
+                }
+                core().mark_dirty();
+                core().flush_config();
+                core().apply_server_setting(8);
+            })),
+        );
     } else {
         // После обновления прежняя копия программы может ещё несколько секунд держать порт.
         core().apply_server_setting(8);

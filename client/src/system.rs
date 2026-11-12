@@ -322,6 +322,10 @@ pub fn install(invite: Option<&Invite>, autostart: bool, progress: &dyn Fn(&str)
 
     progress("Сохраняю настройки…");
     let mut cfg = Config::load_from(crate::config::roaming_dir().join("config.toml"));
+    // Старые поля версии 0.2 при сохранении пропадают — переносим сервер здесь же.
+    if cfg.migrate_legacy_server() {
+        clog!("установщик: настройки сервера перенесены из Mumble Server (версия 0.2)");
+    }
     if let Some(inv) = invite {
         cfg.server = inv.server.clone();
         if let Some(n) = &inv.network {

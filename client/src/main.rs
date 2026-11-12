@@ -12,9 +12,11 @@ mod headless;
 mod jitter;
 mod net;
 mod ocb2;
+mod p2p;
 mod proto;
 mod server;
 mod system;
+mod transport;
 mod ui;
 mod update;
 mod varint;
@@ -46,6 +48,10 @@ fn main() {
     }
     if has("--server") {
         headless::run_server(&args);
+        return;
+    }
+    if has("--p2p-selftest") {
+        p2p::selftest();
         return;
     }
     win::set_app_id();

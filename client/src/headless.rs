@@ -11,6 +11,7 @@
 //!
 //! Только сервер (на отдельном компьютере или для проверок):
 //!   raciya.exe --server [--port N] [--password P] [--users N] [--welcome T] [--seconds N]
+//!                       [--no-p2p] [--no-dht] [--p2p-port N]
 //!   Без ключей берутся настройки сервера из config.toml. Журнал — %APPDATA%\Raciya\server\server.log.
 
 use crate::config::Config;
@@ -25,7 +26,19 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
 pub fn run_server(args: &[String]) {
     crate::log::init_server(crate::server::data_dir().join("server.log"));
     let cfg = Config::load();
-    let mut settings = cfg.host().settings();
+    let mut host = cfg.host();
+    // P2P без ключа --no-p2p; секрет комнаты — из настроек или новый (только на этот запуск).
+    host.p2p = !args.iter().any(|a| a == "--no-p2p");
+    host.ensure_p2p();
+    if let Some(p) = arg_value(args, "--p2p-port").and_then(|v| v.parse().ok()) {
+        host.p2p_port = p;
+    }
+    let mut settings = host.settings();
+    if args.iter().any(|a| a == "--no-dht") {
+        if let Some(p) = settings.p2p.as_mut() {
+            p.dht = false;
+        }
+    }
     if let Some(p) = arg_value(args, "--port").and_then(|v| v.parse().ok()) {
         settings.port = p;
     }
@@ -47,6 +60,15 @@ pub fn run_server(args: &[String]) {
         }
     };
     println!("server: listening on port {}, certificate {}", server.port(), server.fingerprint());
+    if let (Some(port), Some(secret)) = (server.p2p_port(), host.room) {
+        let lan = crate::diag::local_addresses()
+            .iter()
+            .filter(|(l, _)| *l != "ZeroTier")
+            .map(|(_, ip)| std::net::SocketAddr::from((*ip, port)))
+            .collect();
+        let code = crate::p2p::Invite { secret, fingerprint: server.fingerprint_prefix(), lan, zt: None }.encode();
+        println!("server: P2P on UDP {port}, invite {code}");
+    }
     let t0 = Instant::now();
     let mut last = String::new();
     loop {
@@ -57,8 +79,10 @@ pub fn run_server(args: &[String]) {
             .map(|u| format!("{}#{}@{}{}", u.name, u.session, u.addr, if u.udp { "" } else { "(tcp)" }))
             .collect();
         let line = users.join(", ");
+        let p2p = server.p2p_status().map(|p| format!(" p2p: published at {} nodes, external {:?}", p.announced, p.external)).unwrap_or_default();
+        let line = format!("{line}]{p2p}");
         if line != last {
-            println!("[server {:>6}] users: [{line}]", t0.elapsed().as_millis());
+            println!("[server {:>6}] users: [{line}", t0.elapsed().as_millis());
             last = line;
         }
         if seconds.map(|s| t0.elapsed() >= Duration::from_secs(s)).unwrap_or(false) {
@@ -69,6 +93,8 @@ pub fn run_server(args: &[String]) {
 }
 
 pub fn run(args: &[String]) {
+    // Свой журнал, чтобы проверки не смешивались с журналом обычной работы.
+    crate::log::init_client(crate::system::user_dir().join("headless.log"));
     let mut cfg = Config::default();
     cfg.server = arg_value(args, "--server").unwrap_or_else(|| "127.0.0.1".into());
     cfg.username = arg_value(args, "--user").unwrap_or_else(|| "headless".into());
@@ -117,6 +143,8 @@ pub fn run(args: &[String]) {
                 Event::KeyCaptured(k) => println!("[{tag} {t:>6}] key captured: {k:?}"),
                 Event::Devices { input, output } => println!("[{tag} {t:>6}] devices: in='{input}' out='{output}'"),
                 Event::Server => {}
+                Event::Progress(p) if !p.is_empty() => println!("[{tag} {t:>6}] progress: {p}"),
+                Event::Progress(_) => {}
             }
         }),
     );

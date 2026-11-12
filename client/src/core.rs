@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::net::{describe_connect_error, Link, LinkEvent, LinkHandler};
 use crate::proto;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -33,6 +34,8 @@ pub enum Event {
     Devices { input: String, output: String },
     /// Изменилось состояние сервера на этом компьютере — интерфейс перечитывает `Core::server_view()`.
     Server,
+    /// Ход подключения («ищу сервер…»); пустая строка — убрать.
+    Progress(String),
 }
 
 /// Состояние сервера на этом компьютере для интерфейса.
@@ -46,6 +49,9 @@ pub struct ServerView {
     pub error: Option<String>,
     /// Ошибку можно исправить системной настройкой (права администратора).
     pub fixable: bool,
+    /// Код приглашения для доступа через интернет (P2P), если он включён и работает.
+    pub invite: Option<String>,
+    pub p2p: Option<crate::p2p::HostStatus>,
 }
 
 #[derive(Clone, Debug)]
@@ -264,11 +270,22 @@ impl Core {
     /// Запускает, перенастраивает или останавливает встроенный сервер по настройкам `[host]`.
     /// `retries` — сколько раз повторить запуск, если порт ещё занят (раз в секунду).
     pub fn apply_server_setting(self: &Arc<Self>, retries: u32) {
-        let host = self.cfg.lock().unwrap().host();
+        let host = {
+            let mut cfg = self.cfg.lock().unwrap();
+            // Секрет комнаты и P2P-порт появляются при первом запуске сервера с P2P.
+            let created = cfg.host.as_mut().map(|h| h.enabled && h.ensure_p2p()).unwrap_or(false);
+            if created {
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+            cfg.host()
+        };
+        if self.dirty.load(Ordering::Relaxed) {
+            self.flush_config();
+        }
         let gen = self.server_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let current = self.server.lock().unwrap().take();
         if let Some(s) = current {
-            if host.enabled && s.port() == host.port {
+            if host.enabled && s.port() == host.port && s.p2p_port().is_some() == host.settings().p2p.is_some() {
                 // Тот же порт: пароль и остальное применяются без перезапуска.
                 s.update(&host.settings());
                 *self.server.lock().unwrap() = Some(s);
@@ -367,14 +384,32 @@ impl Core {
         let host = self.cfg.lock().unwrap().host();
         let server = self.server.lock().unwrap().clone();
         let error = self.server_error.lock().unwrap().clone();
+        let zt_network = self.cfg.lock().unwrap().zt_network.clone();
+        let invite = server.as_ref().and_then(|s| {
+            let secret = host.room?;
+            let p2p_port = s.p2p_port()?;
+            let addrs = crate::diag::local_addresses();
+            let lan = addrs
+                .iter()
+                .filter(|(l, _)| *l != "ZeroTier")
+                .map(|(_, ip)| SocketAddr::from((*ip, p2p_port)))
+                .collect();
+            let zt = addrs.iter().find(|(l, _)| *l == "ZeroTier").filter(|_| !zt_network.is_empty()).map(|(_, ip)| {
+                let addr = if s.port() == crate::config::DEFAULT_PORT { ip.to_string() } else { format!("{ip}:{}", s.port()) };
+                format!("{zt_network}@{addr}")
+            });
+            Some(crate::p2p::Invite { secret, fingerprint: s.fingerprint_prefix(), lan, zt }.encode())
+        });
         ServerView {
             enabled: host.enabled,
             starting: self.server_starting.load(Ordering::SeqCst),
             running: server.is_some(),
             port: server.as_ref().map(|s| s.port()).unwrap_or(host.port),
-            users: server.map(|s| s.users().into_iter().map(|u| u.name).collect()).unwrap_or_default(),
+            users: server.as_ref().map(|s| s.users().into_iter().map(|u| u.name).collect()).unwrap_or_default(),
             fixable: error.as_ref().map(|e| e.fixable()).unwrap_or(false),
             error: error.map(|e| e.describe()),
+            p2p: server.as_ref().and_then(|s| s.p2p_status()),
+            invite,
         }
     }
 
@@ -386,10 +421,11 @@ impl Core {
 
     /// Сведения о текущем соединении для проверки сети.
     pub fn diag_context(&self) -> crate::diag::Context {
-        let (server_host, server_port, zt_network, runs_server, host_port) = {
+        let (server_host, server_port, zt_network, runs_server, host_port, uses_p2p) = {
             let cfg = self.cfg.lock().unwrap();
             let (h, p) = cfg.host_port();
-            (h, p, cfg.zt_network.clone(), cfg.hosting(), cfg.host().port)
+            let p2p = crate::p2p::Invite::parse(&cfg.server).is_some();
+            (h, p, cfg.zt_network.clone(), cfg.hosting(), cfg.host().port, p2p)
         };
         let server_error = self.server_error.lock().unwrap().as_ref().map(|e| (e.describe(), e.fixable()));
         let (avg, jitter) = {
@@ -431,6 +467,8 @@ impl Core {
             host_port,
             status: self.status(),
             force: false,
+            uses_p2p,
+            p2p_host: self.server.lock().unwrap().as_ref().and_then(|s| s.p2p_status()),
         }
     }
 
@@ -476,15 +514,9 @@ impl Core {
                 self.set_status(Status::Connecting);
             }
 
-            let (host, port, username, password) = {
-                let cfg = self.cfg.lock().unwrap();
-                let (h, p) = cfg.host_port();
-                (h, p, cfg.username.clone(), cfg.password.clone())
-            };
             let bridge = Arc::new(Bridge { core: Arc::downgrade(&self), audio: self.audio.clone(), gen });
             let mut was_online = false;
-            clog!("подключение к {host}:{port} как «{username}»");
-            let reason = match Link::connect(&host, port, &username, &password, bridge) {
+            let reason = match self.open_link(bridge) {
                 Ok(link) => {
                     if self.no_udp.load(Ordering::Relaxed) {
                         link.set_udp_disabled(true);
@@ -504,9 +536,8 @@ impl Core {
                     clog!("соединение закрыто: {reason}");
                     reason
                 }
-                Err(e) => {
-                    let reason = describe_connect_error(&e);
-                    clog!("не удалось подключиться: {reason} ({e})");
+                Err(reason) => {
+                    clog!("не удалось подключиться: {reason}");
                     reason
                 }
             };
@@ -550,6 +581,68 @@ impl Core {
                 .cv
                 .wait_timeout_while(c, Duration::from_secs(delay), |c| c.want && !c.quit)
                 .unwrap();
+        }
+    }
+
+    /// Открывает соединение: по обычному адресу (TCP + UDP) или по коду приглашения v2 (P2P,
+    /// а если не вышло и подключена ZeroTier — через неё).
+    fn open_link(&self, bridge: Arc<Bridge>) -> Result<Arc<Link>, String> {
+        let (server, username, password, last) = {
+            let cfg = self.cfg.lock().unwrap();
+            (cfg.server.clone(), cfg.username.clone(), cfg.password.clone(), cfg.p2p_last.parse::<SocketAddr>().ok())
+        };
+        let tcp = |host: &str, port: u16| {
+            clog!("подключение к {host}:{port} как «{username}»");
+            Link::connect(host, port, &username, &password, bridge.clone()).map_err(|e| {
+                let reason = describe_connect_error(&e);
+                clog!("  {e}");
+                reason
+            })
+        };
+        let Some(inv) = crate::p2p::Invite::parse(&server) else {
+            let (host, port) = self.cfg.lock().unwrap().host_port();
+            return tcp(&host, port);
+        };
+        clog!("подключение через P2P как «{username}»");
+        let mut hints = inv.lan.clone();
+        if let Some(l) = last {
+            hints.insert(0, l);
+        }
+        let progress = |stage: crate::p2p::Stage| {
+            let text = match stage {
+                crate::p2p::Stage::Searching => "ищу сервер…",
+                crate::p2p::Stage::Punching => "устанавливаю прямое соединение…",
+            };
+            self.emit(Event::Progress(text.into()));
+        };
+        let room = crate::p2p::Room::new(inv.secret);
+        let dialed = crate::p2p::dial(&room, &hints, true, Duration::from_secs(20), &progress);
+        self.emit(Event::Progress(String::new()));
+        match dialed {
+            Ok(conn) => {
+                let peer = conn.peer().to_string();
+                {
+                    let mut cfg = self.cfg.lock().unwrap();
+                    if cfg.p2p_last != peer {
+                        cfg.p2p_last = peer;
+                        self.dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+                Link::connect_p2p(Arc::new(conn), inv.fingerprint, &username, &password, bridge.clone())
+                    .map_err(|e| describe_connect_error(&e))
+            }
+            Err(e) => {
+                // Запасной путь — ZeroTier, если сеть уже подключена на этом компьютере.
+                if let Some(zt) = &inv.zt {
+                    let joined = crate::diag::local_addresses().iter().any(|(l, _)| *l == "ZeroTier");
+                    if let (true, Some((h, p))) = (joined, crate::config::parse_address(zt)) {
+                        clog!("P2P не удалось ({e}) — подключаюсь через ZeroTier");
+                        return tcp(&h, p);
+                    }
+                    return Err(format!("{e}. Запасной путь — ZeroTier: «Сеть» → «Исправить»"));
+                }
+                Err(e.to_string())
+            }
         }
     }
 

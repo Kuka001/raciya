@@ -7,6 +7,7 @@
 use crate::framing::{frame, frame_msg, Deframer};
 use crate::ocb2::CryptState;
 use crate::proto::*;
+use crate::transport::{Datagrams, Stream, StreamWriter};
 use crate::varint::{read_varint, write_varint};
 use prost::Message;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -37,19 +38,30 @@ pub trait LinkHandler: Send + Sync + 'static {
 }
 
 #[derive(Debug)]
-struct AcceptAnyCert(Arc<CryptoProvider>);
+struct ServerCert {
+    provider: Arc<CryptoProvider>,
+    /// Начало SHA-256 сертификата из кода приглашения: сервер должен быть именно тот.
+    expect: Option<[u8; 16]>,
+}
 
 /// Сервер использует самоподписанный сертификат, поэтому цепочка доверия не проверяется.
-/// Подписи рукопожатия проверяются как обычно; доступ к серверу защищён паролем.
-impl ServerCertVerifier for AcceptAnyCert {
+/// Если адрес пришёл из кода приглашения v2, сертификат сверяется с отпечатком из кода —
+/// подменить сервер нельзя. Подписи рукопожатия проверяются как обычно.
+impl ServerCertVerifier for ServerCert {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        if let Some(expect) = self.expect {
+            let d = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+            if d.as_ref()[..16] != expect {
+                return Err(rustls::Error::General("сертификат сервера не совпадает с кодом приглашения".into()));
+            }
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -59,7 +71,7 @@ impl ServerCertVerifier for AcceptAnyCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn verify_tls13_signature(
@@ -68,18 +80,20 @@ impl ServerCertVerifier for AcceptAnyCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
 
 pub struct Link {
     tls: Mutex<ClientConnection>,
-    tcp: TcpStream,
-    udp: UdpSocket,
+    /// Управляющий канал: TCP или P2P-поток.
+    stream: Arc<dyn Stream>,
+    /// Голос: UDP-сокет или датаграммы P2P-потока.
+    dgram: Arc<dyn Datagrams>,
     /// Кадры для потока записи.
     tx: SyncSender<Vec<u8>>,
     crypt: Mutex<Option<CryptState>>,
@@ -142,12 +156,40 @@ impl Link {
         udp.set_read_timeout(Some(Duration::from_millis(500)))?;
         let dscp = crate::win::mark_voice_socket(&udp);
 
+        Link::start(Arc::new(tcp), Arc::new(udp), host, addr, None, dscp, username, password, handler)
+    }
+
+    /// Соединение через P2P (код приглашения v2): TLS и голос внутри одного UDP-потока.
+    pub fn connect_p2p(
+        conn: Arc<crate::p2p::Conn>,
+        fingerprint: [u8; 16],
+        username: &str,
+        password: &str,
+        handler: Arc<dyn LinkHandler>,
+    ) -> io::Result<Arc<Link>> {
+        let addr = conn.peer();
+        Stream::set_timeout(conn.as_ref(), Duration::from_secs(20));
+        Link::start(conn.clone(), conn, "mumble.invalid", addr, Some(fingerprint), false, username, password, handler)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        stream: Arc<dyn Stream>,
+        dgram: Arc<dyn Datagrams>,
+        host: &str,
+        addr: SocketAddr,
+        expect: Option<[u8; 16]>,
+        dscp: bool,
+        username: &str,
+        password: &str,
+        handler: Arc<dyn LinkHandler>,
+    ) -> io::Result<Arc<Link>> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(|e| other(e.to_string()))?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_custom_certificate_verifier(Arc::new(ServerCert { provider, expect }))
             .with_no_client_auth();
         let name = ServerName::try_from(host.to_string())
             .or_else(|_| ServerName::try_from("mumble.invalid".to_string()))
@@ -157,8 +199,8 @@ impl Link {
         let (tx, rx) = sync_channel::<Vec<u8>>(256);
         let link = Arc::new(Link {
             tls: Mutex::new(conn),
-            tcp,
-            udp,
+            stream,
+            dgram,
             tx,
             crypt: Mutex::new(None),
             handler,
@@ -263,7 +305,7 @@ impl Link {
 
     fn shutdown(&self, reason: String) {
         self.alive.store(false, Ordering::SeqCst);
-        let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+        self.stream.close();
         if !self.closed_sent.swap(true, Ordering::SeqCst) {
             self.handler.on_event(LinkEvent::Closed(reason));
         }
@@ -278,9 +320,9 @@ impl Link {
     }
 
     fn flush_locked(&self, tls: &mut ClientConnection) -> io::Result<()> {
-        let mut sock = &self.tcp;
+        let mut w = StreamWriter(self.stream.as_ref());
         while tls.wants_write() {
-            tls.write_tls(&mut sock)?;
+            tls.write_tls(&mut w)?;
         }
         Ok(())
     }
@@ -339,7 +381,7 @@ impl Link {
                 }
             };
             if n > 0 {
-                let r = self.udp.send(&out[..n]);
+                let r = self.dgram.send(&out[..n]);
                 if crate::win::trace_level() > 0 && (out[0] <= 1 || out[0] == 255 || r.is_err()) {
                     eprintln!("udp: sent ivbyte={} plain_head={:02x?} result={:?}", out[0], &plain[..plain.len().min(4)], r);
                 }
@@ -371,13 +413,12 @@ impl Link {
         let mut raw = vec![0u8; 16 * 1024];
         let mut frames = Deframer::new(8 * 1024 * 1024);
         let mut tmp = [0u8; 4096];
-        let mut sock = &self.tcp;
         {
             let mut tls = self.tls.lock().unwrap();
             self.flush_locked(&mut tls)?;
         }
         while self.is_alive() {
-            let n = sock.read(&mut raw)?;
+            let n = self.stream.recv(&mut raw)?;
             if n == 0 {
                 return Err(other("сервер закрыл соединение"));
             }
@@ -497,7 +538,7 @@ impl Link {
         let mut buf = [0u8; 2048];
         let mut plain = [0u8; 2048];
         while self.is_alive() {
-            match self.udp.recv(&mut buf) {
+            match self.dgram.recv(&mut buf) {
                 Ok(n) if n > 4 => {
                     if self.udp_disabled.load(Ordering::Relaxed) {
                         continue;
@@ -590,7 +631,7 @@ impl Link {
             }
         };
         if n > 0 {
-            let _ = self.udp.send(&out[..n]);
+            let _ = self.dgram.send(&out[..n]);
         }
     }
 

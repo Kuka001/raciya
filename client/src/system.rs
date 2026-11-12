@@ -123,6 +123,10 @@ pub struct Invite {
 
 pub fn parse_invite(text: &str) -> Option<Invite> {
     let t = text.trim().trim_start_matches('\u{feff}');
+    // Код приглашения v2 (P2P) хранится целиком; ZeroTier из него — только запасной путь.
+    if crate::p2p::Invite::parse(t).is_some() {
+        return Some(Invite { network: None, server: t.to_string() });
+    }
     let (network, server) = match t.split_once('@') {
         Some((net, server)) => {
             let net = net.trim().to_lowercase();
@@ -330,6 +334,14 @@ pub fn install(invite: Option<&Invite>, autostart: bool, progress: &dyn Fn(&str)
         cfg.server = inv.server.clone();
         if let Some(n) = &inv.network {
             cfg.zt_network = n.clone();
+        }
+        // Запасная сеть из кода v2 запоминается, но не подключается (без прав администратора).
+        if let Some(n) = crate::p2p::Invite::parse(&inv.server)
+            .and_then(|v2| v2.zt)
+            .and_then(|zt| parse_invite(&zt))
+            .and_then(|i| i.network)
+        {
+            cfg.zt_network = n;
         }
     }
     cfg.save();

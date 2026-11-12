@@ -71,7 +71,7 @@ fn test_dir() -> std::path::PathBuf {
 }
 
 fn start(max_users: u32) -> Arc<Server> {
-    let settings = Settings { port: 0, password: "секрет".into(), max_users, welcome: "привет".into(), name: "Тест".into() };
+    let settings = Settings { port: 0, password: "секрет".into(), max_users, welcome: "привет".into(), name: "Тест".into(), p2p: None };
     // Порт 0: TCP получает свободный порт, UDP пробует такой же; в редком случае он занят — повторяем.
     for _ in 0..5 {
         match Server::start(settings.clone(), test_dir(), Box::new(|| {})) {

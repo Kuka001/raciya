@@ -260,7 +260,12 @@ impl Ui {
             (1, "Запускается…".to_string())
         } else if v.running {
             let n = v.users.len();
-            (2, format!("Работает · порт {} · участников: {n}", v.port))
+            let internet = match &v.p2p {
+                Some(p) if p.announced > 0 => " · доступен из интернета",
+                Some(_) => " · публикую адрес для интернета…",
+                None => "",
+            };
+            (2, format!("Работает · порт {} · участников: {n}{internet}", v.port))
         } else if let Some(e) = &v.error {
             (3, capitalize(e))
         } else {
@@ -275,23 +280,31 @@ impl Ui {
         } else {
             SharedString::new()
         });
-        let zt_network = core().cfg.lock().unwrap().zt_network.clone();
+        let (zt_network, p2p_on) = {
+            let cfg = core().cfg.lock().unwrap();
+            (cfg.zt_network.clone(), cfg.host().p2p)
+        };
+        self.win.set_srv_p2p(p2p_on);
         let mut items = Vec::new();
-        let mut invite = String::new();
+        if let Some(code) = &v.invite {
+            items.push(AddressItem { label: "Код приглашения (через интернет)".into(), value: code.as_str().into() });
+        }
         if v.enabled {
             let port_suffix = if v.port == crate::config::DEFAULT_PORT { String::new() } else { format!(":{}", v.port) };
             for (label, ip) in diag::local_addresses() {
                 let addr = format!("{ip}{port_suffix}");
-                if label == "ZeroTier" && !zt_network.is_empty() && invite.is_empty() {
-                    invite = system::make_invite(Some(&zt_network), &addr);
-                    items.push(AddressItem { label: "Код приглашения (через ZeroTier)".into(), value: invite.clone().into() });
+                if label == "ZeroTier" {
+                    if !zt_network.is_empty() {
+                        let code = system::make_invite(Some(&zt_network), &addr);
+                        items.push(AddressItem { label: "ZeroTier (версия 0.3 и Mumble)".into(), value: code.into() });
+                    }
                 } else {
                     items.push(AddressItem { label: label.into(), value: addr.into() });
                 }
             }
         }
         self.win.set_srv_addresses(ModelRc::new(VecModel::from(items)));
-        self.win.set_invite_code(invite.into());
+        self.win.set_invite_code(v.invite.clone().unwrap_or_default().into());
     }
 
     /// Поля страницы «Сервер» — из сохранённых настроек.
@@ -551,6 +564,11 @@ fn on_core_event(ev: Event) {
         }
         Event::Devices { .. } => refresh_devices(),
         Event::Server => ui.apply_server_view(),
+        Event::Progress(p) => {
+            if core().status() != Status::Online {
+                ui.win.set_status_detail(capitalize(&p).into());
+            }
+        }
     });
 }
 
@@ -938,6 +956,20 @@ pub fn run(args: &[String]) {
         let mut join_network = false;
         with_ui(|ui| {
             let text = ui.win.get_server().to_string();
+            // Код приглашения v2 (P2P): хранится целиком; сеть ZeroTier из него — только запасной путь,
+            // подключается по кнопке «Исправить», если прямое соединение не получится.
+            if let Some(inv) = crate::p2p::Invite::parse(&text) {
+                if let Some(n) = inv.zt.as_deref().and_then(system::parse_invite).and_then(|i| i.network) {
+                    core().cfg.lock().unwrap().zt_network = n;
+                }
+                let code = text.trim().to_string();
+                ui.win.set_server(code.clone().into());
+                core().set_connection(&code, &ui.win.get_username(), &ui.win.get_password(), ui.win.get_autoconnect());
+                ui.win.set_wants_connection(true);
+                ui.win.set_page(0);
+                ui.update_level_timer();
+                return;
+            }
             // Код с виртуальной сетью: адрес — отдельно, сеть подключается (если ещё нет).
             let server = match system::parse_invite(&text) {
                 Some(inv) => {
@@ -1099,6 +1131,11 @@ pub fn run(args: &[String]) {
         }
     });
     window.on_fix_server(|| run_system_setup("server"));
+    window.on_set_server_p2p(|on| {
+        let mut host = core().cfg.lock().unwrap().host();
+        host.p2p = on;
+        core().set_host(host);
+    });
     window.on_copy_text(|text| {
         let ok = win::copy_to_clipboard(&text);
         with_ui(|ui| ui.show_notice(if ok { format!("скопировано: {text}") } else { "не удалось скопировать".into() }));

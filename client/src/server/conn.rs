@@ -6,8 +6,10 @@ use crate::ocb2::CryptState;
 use crate::proto::*;
 use prost::Message;
 use ring::rand::SecureRandom;
+use crate::p2p::flow::Flow;
+use crate::transport::{Stream, StreamWriter};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -21,54 +23,15 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TEXT: usize = 5000;
 
-/// Транспорт управляющего канала: сейчас TCP, в будущем — P2P-поток.
-pub(crate) trait Wire: Send + Sync + 'static {
-    fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
-    fn send_all(&self, buf: &[u8]) -> io::Result<()>;
-    fn set_timeout(&self, t: Duration);
-    fn close(&self);
-}
-
-impl Wire for TcpStream {
-    fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        (&*self).read(buf)
-    }
-
-    fn send_all(&self, buf: &[u8]) -> io::Result<()> {
-        (&*self).write_all(buf)
-    }
-
-    fn set_timeout(&self, t: Duration) {
-        let _ = self.set_read_timeout(Some(t));
-    }
-
-    fn close(&self) {
-        let _ = self.shutdown(Shutdown::Both);
-    }
-}
-
-struct WireWriter<'a>(&'a dyn Wire);
-
-impl Write for WireWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.send_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 /// TLS поверх транспорта. Читает один поток, пишут несколько (под замком).
 pub(crate) struct Pipe {
     tls: Mutex<rustls::ServerConnection>,
-    wire: Box<dyn Wire>,
+    wire: Box<dyn Stream>,
 }
 
 impl Pipe {
     fn flush(&self, tls: &mut rustls::ServerConnection) -> io::Result<()> {
-        let mut w = WireWriter(self.wire.as_ref());
+        let mut w = StreamWriter(self.wire.as_ref());
         while tls.wants_write() {
             tls.write_tls(&mut w)?;
         }
@@ -132,13 +95,12 @@ fn deny(c: &Client, reason: &str) {
     ));
 }
 
-/// Обслуживает соединение от начала до конца.
-pub(crate) fn serve(sh: &Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    stream.set_timeout(LOGIN_TIMEOUT);
+/// Обслуживает соединение от начала до конца. `flow` — соединение пришло через P2P:
+/// тогда голос идёт датаграммами в этом же потоке, а не на UDP-порт сервера.
+pub(crate) fn serve(sh: &Arc<Shared>, wire: Box<dyn Stream>, peer: SocketAddr, flow: Option<Arc<Flow>>) {
+    wire.set_timeout(LOGIN_TIMEOUT);
     let Ok(conn) = rustls::ServerConnection::new(sh.tls.clone()) else { return };
-    let pipe = Arc::new(Pipe { tls: Mutex::new(conn), wire: Box::new(stream) });
+    let pipe = Arc::new(Pipe { tls: Mutex::new(conn), wire });
     // Сервер представляется первым (rustls придержит данные до конца рукопожатия).
     if pipe.send(&frame_msg(T_VERSION, &server_version())).is_err() {
         return;
@@ -241,7 +203,8 @@ pub(crate) fn serve(sh: &Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
             pipe: pipe.clone(),
             crypt: Mutex::new(crypt),
             udp_addr: Mutex::new(None),
-            udp_ok: AtomicBool::new(false),
+            udp_ok: AtomicBool::new(flow.is_some()),
+            p2p: flow.clone(),
             self_mute: AtomicBool::new(false),
             self_deaf: AtomicBool::new(false),
             last_udp_good_ms: AtomicU64::new(0),
@@ -302,8 +265,24 @@ pub(crate) fn serve(sh: &Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
             },
         ));
     }
+    if let Some(f) = &flow {
+        // Голос из P2P-потока: расшифровка ключом этого участника и пересылка остальным.
+        let (wc, ws) = (Arc::downgrade(&client), Arc::downgrade(sh));
+        f.set_voice_handler(Some(Arc::new(move |data: &[u8]| {
+            let (Some(c), Some(s)) = (wc.upgrade(), ws.upgrade()) else { return };
+            if !(5..=1500).contains(&data.len()) {
+                return;
+            }
+            let mut plain = [0u8; 1500];
+            if c.crypt.lock().unwrap().decrypt(data, &mut plain[..data.len() - 4]) {
+                c.last_udp_good_ms.store(s.now_ms(), Ordering::Relaxed);
+                voice::handle(&s, &c, &plain[..data.len() - 4], voice::Via::Udp);
+            }
+        })));
+    }
     let client_ver = if auth.opus == Some(false) { " (клиент без Opus — звук не услышит)" } else { "" };
-    slog!("вошёл: «{}» с {peer}, сессия {}{client_ver}", client.name, client.session);
+    let via = if flow.is_some() { " через P2P" } else { "" };
+    slog!("вошёл: «{}» с {peer}{via}, сессия {}{client_ver}", client.name, client.session);
     (sh.notify)();
 
     pipe.wire.set_timeout(IDLE_TIMEOUT);

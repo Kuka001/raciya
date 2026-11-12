@@ -72,6 +72,10 @@ pub(crate) fn handle(sh: &Shared, from: &Arc<Client>, plain: &[u8], via: Via) {
 }
 
 fn deliver(sh: &Shared, to: &Client, plain: &[u8]) {
+    if to.p2p.is_some() {
+        send_udp(sh, to, plain);
+        return;
+    }
     if to.udp_ok.load(Ordering::Relaxed) {
         let addr = *to.udp_addr.lock().unwrap();
         if let Some(addr) = addr {
@@ -83,6 +87,18 @@ fn deliver(sh: &Shared, to: &Client, plain: &[u8]) {
 }
 
 fn send_udp(sh: &Shared, to: &Client, plain: &[u8]) {
+    if let Some(f) = &to.p2p {
+        // P2P: голос — датаграммой в потоке этого участника.
+        let mut buf = [0u8; MAX_VOICE + 16];
+        if plain.len() + 4 > buf.len() {
+            return;
+        }
+        let n = to.crypt.lock().unwrap().encrypt(plain, &mut buf);
+        if n > 0 {
+            let _ = crate::transport::Datagrams::send(f.as_ref(), &buf[..n]);
+        }
+        return;
+    }
     let addr = *to.udp_addr.lock().unwrap();
     if let Some(addr) = addr {
         send_udp_to(sh, to, addr, plain);

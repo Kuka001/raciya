@@ -41,6 +41,16 @@ pub const PERMISSIONS: u32 = 0x2 | 0x4 | 0x8 | 0x100 | 0x200;
 /// Сколько трафика разрешено одному участнику (бит/с) — официальные клиенты подстраиваются.
 pub const MAX_BANDWIDTH: u32 = 128_000;
 
+/// Доступ к серверу через свой P2P (поиск по коду приглашения в DHT, пробивание NAT).
+#[derive(Clone, Debug, PartialEq)]
+pub struct P2pSettings {
+    pub secret: [u8; 16],
+    /// UDP-порт P2P (0 — любой свободный).
+    pub port: u16,
+    /// Публиковать адрес в DHT (без этого — только по адресам из кода, для проверок).
+    pub dht: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub port: u16,
@@ -49,6 +59,7 @@ pub struct Settings {
     pub max_users: u32,
     pub welcome: String,
     pub name: String,
+    pub p2p: Option<P2pSettings>,
 }
 
 impl Default for Settings {
@@ -59,6 +70,7 @@ impl Default for Settings {
             max_users: DEFAULT_MAX_USERS,
             welcome: String::new(),
             name: "Рация".into(),
+            p2p: None,
         }
     }
 }
@@ -245,6 +257,8 @@ pub(crate) struct Client {
     pub resync: AtomicU32,
     pub rate: Mutex<Rate>,
     pub dead: AtomicBool,
+    /// Участник пришёл через P2P: голос идёт датаграммами в этом потоке.
+    pub p2p: Option<Arc<crate::p2p::flow::Flow>>,
 }
 
 impl Client {
@@ -289,6 +303,7 @@ pub struct Server {
     port: u16,
     fingerprint: String,
     accept: Mutex<Option<JoinHandle<()>>>,
+    p2p: Option<Arc<crate::p2p::Host>>,
 }
 
 fn classify(e: std::io::Error, port: u16, udp: bool) -> StartError {
@@ -358,12 +373,20 @@ impl Server {
             })
             .map_err(|e| StartError::Other(e.to_string()))?;
 
+        let p2p = settings.p2p.as_ref().and_then(|ps| start_p2p(&shared, ps));
         slog!(
-            "сервер запущен: порт {port}, мест {}, пароль {}",
+            "сервер запущен: порт {port}, мест {}, пароль {}{}",
             settings.max_users,
-            if settings.password.is_empty() { "не задан" } else { "задан" }
+            if settings.password.is_empty() { "не задан" } else { "задан" },
+            p2p.as_ref().map(|h| format!(", P2P на UDP {}", h.port())).unwrap_or_default()
         );
-        Ok(Arc::new(Server { shared, port, fingerprint: identity.fingerprint(), accept: Mutex::new(Some(accept)) }))
+        Ok(Arc::new(Server {
+            shared,
+            port,
+            fingerprint: identity.fingerprint(),
+            accept: Mutex::new(Some(accept)),
+            p2p,
+        }))
     }
 
     pub fn port(&self) -> u16 {
@@ -372,6 +395,24 @@ impl Server {
 
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// Первые 16 байт отпечатка сертификата — для кода приглашения.
+    pub fn fingerprint_prefix(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        if let Some(b) = crate::win::from_hex(&self.fingerprint) {
+            out.copy_from_slice(&b[..16]);
+        }
+        out
+    }
+
+    /// UDP-порт P2P, если доступ через интернет включён и работает.
+    pub fn p2p_port(&self) -> Option<u16> {
+        self.p2p.as_ref().map(|h| h.port())
+    }
+
+    pub fn p2p_status(&self) -> Option<crate::p2p::HostStatus> {
+        self.p2p.as_ref().map(|h| h.status())
     }
 
     pub fn users(&self) -> Vec<UserInfo> {
@@ -406,6 +447,9 @@ impl Server {
             let _ = h.join();
         }
         self.shared.udp.close();
+        if let Some(h) = &self.p2p {
+            h.stop();
+        }
         let clients: Vec<Arc<Client>> = {
             let mut st = self.shared.state.lock().unwrap();
             st.by_udp.clear();
@@ -437,15 +481,86 @@ fn accept_loop(sh: Arc<Shared>, listener: TcpListener) {
         if !sh.guard.lock().unwrap().admit(peer.ip(), Instant::now()) {
             continue;
         }
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let s = sh.clone();
         let spawned = std::thread::Builder::new().name("srv-conn".into()).stack_size(512 * 1024).spawn(move || {
             crate::win::set_thread_priority(crate::win::Prio::Low);
-            conn::serve(&s, stream, peer);
+            conn::serve(&s, Box::new(stream), peer, None);
             s.guard.lock().unwrap().release(peer.ip());
         });
         if spawned.is_err() {
             sh.guard.lock().unwrap().release(peer.ip());
         }
+    }
+}
+
+/// Запускает P2P-доступ. Если заданный порт занят — берёт любой свободный (код приглашения
+/// всё равно найдёт сервер через DHT; меняются только адреса для локальной сети).
+fn start_p2p(sh: &Arc<Shared>, ps: &P2pSettings) -> Option<Arc<crate::p2p::Host>> {
+    let room = crate::p2p::Room::new(ps.secret);
+    let make = |port: u16| {
+        let weak = Arc::downgrade(sh);
+        let weak_notify = Arc::downgrade(sh);
+        crate::p2p::Host::start_with(
+            room.clone(),
+            port,
+            ps.dht,
+            Box::new(move |flow: Arc<crate::p2p::flow::Flow>| {
+                let Some(s) = weak.upgrade() else { return };
+                let peer = flow.peer;
+                if s.stop.load(Ordering::SeqCst) || !s.guard.lock().unwrap().admit(peer.ip(), Instant::now()) {
+                    flow.shutdown();
+                    return;
+                }
+                let s2 = s.clone();
+                let spawned = std::thread::Builder::new().name("srv-p2p".into()).stack_size(512 * 1024).spawn(move || {
+                    crate::win::set_thread_priority(crate::win::Prio::Low);
+                    let wire: Box<dyn crate::transport::Stream> = Box::new(FlowStream(flow.clone()));
+                    conn::serve(&s, wire, peer, Some(flow));
+                    s.guard.lock().unwrap().release(peer.ip());
+                });
+                if spawned.is_err() {
+                    s2.guard.lock().unwrap().release(peer.ip());
+                }
+            }),
+            Arc::new(move || {
+                if let Some(s) = weak_notify.upgrade() {
+                    (s.notify)();
+                }
+            }),
+        )
+    };
+    match make(ps.port).or_else(|e| {
+        slog!("P2P: порт {} недоступен ({e}), беру свободный", ps.port);
+        make(0)
+    }) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            slog!("P2P не запустился: {e}");
+            None
+        }
+    }
+}
+
+/// Поток P2P как транспорт управляющего канала.
+struct FlowStream(Arc<crate::p2p::flow::Flow>);
+
+impl crate::transport::Stream for FlowStream {
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        crate::transport::Stream::recv(self.0.as_ref(), buf)
+    }
+
+    fn send_all(&self, buf: &[u8]) -> std::io::Result<()> {
+        crate::transport::Stream::send_all(self.0.as_ref(), buf)
+    }
+
+    fn set_timeout(&self, t: Duration) {
+        crate::transport::Stream::set_timeout(self.0.as_ref(), t)
+    }
+
+    fn close(&self) {
+        self.0.shutdown()
     }
 }
 

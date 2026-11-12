@@ -514,6 +514,7 @@ export component AppWindow inherits Window {
 
     // сервер на этом компьютере
     in property <bool> srv-enabled;
+    in property <bool> srv-p2p: true;
     // 0 — выключен, 1 — запускается, 2 — работает, 3 — ошибка
     in property <int> srv-state;
     in property <string> srv-status: "Выключен";
@@ -558,6 +559,7 @@ export component AppWindow inherits Window {
     callback set-server-enabled(bool);
     callback save-server();
     callback fix-server();
+    callback set-server-p2p(bool);
     callback copy-text(string);
     callback copy-invite();
     callback open-log();
@@ -990,7 +992,7 @@ export component AppWindow inherits Window {
                         LineEdit {
                             height: 36px;
                             text <=> root.server;
-                            placeholder-text: "например 192.168.0.15 или 10.77.64.1:64738";
+                            placeholder-text: "код raciya:… или адрес 192.168.0.15";
                         }
                     }
                     Field {
@@ -1247,6 +1249,14 @@ export component AppWindow inherits Window {
                         checked: root.srv-enabled;
                         toggled(v) => {
                             root.set-server-enabled(v);
+                        }
+                    }
+                    SettingRow {
+                        title: "Доступ через интернет";
+                        hint: "Друзья находят сервер по коду приглашения — без ZeroTier и проброса портов.";
+                        checked: root.srv-p2p;
+                        toggled(v) => {
+                            root.set-server-p2p(v);
                         }
                     }
                     Field {

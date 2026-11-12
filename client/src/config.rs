@@ -23,8 +23,16 @@ pub struct HostConfig {
     /// (брандмауэр и закрепление порта для самой «Рации»). Сбрасывается после неё.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub setup_pending: bool,
+    /// Доступ через интернет без ZeroTier: свой P2P (поиск по коду приглашения в DHT).
+    pub p2p: bool,
+    /// UDP-порт P2P. Выбирается один раз, вне динамической области Windows.
+    pub p2p_port: u16,
+    /// Секрет комнаты P2P, зашифрованный DPAPI (hex). Попадает к друзьям только в коде приглашения.
+    pub room_enc: String,
     #[serde(skip)]
     pub password: String,
+    #[serde(skip)]
+    pub room: Option<[u8; 16]>,
 }
 
 impl Default for HostConfig {
@@ -37,7 +45,11 @@ impl Default for HostConfig {
             welcome: String::new(),
             name: "Рация".into(),
             setup_pending: false,
+            p2p: true,
+            p2p_port: 0,
+            room_enc: String::new(),
             password: String::new(),
+            room: None,
         }
     }
 }
@@ -50,7 +62,28 @@ impl HostConfig {
             max_users: self.max_users,
             welcome: self.welcome.clone(),
             name: self.name.clone(),
+            p2p: match (self.p2p, self.room) {
+                (true, Some(secret)) => Some(crate::server::P2pSettings { secret, port: self.p2p_port, dht: true }),
+                _ => None,
+            },
         }
+    }
+
+    /// Секрет комнаты и P2P-порт создаются при первом включении. `true` — что-то изменилось.
+    pub fn ensure_p2p(&mut self) -> bool {
+        let mut changed = false;
+        if self.p2p && self.room.is_none() {
+            self.room = Some(crate::p2p::Room::generate());
+            changed = true;
+        }
+        if self.p2p && self.p2p_port == 0 {
+            // Вне динамической области (49152+), чтобы Hyper-V/WSL не заняли его после перезагрузки.
+            let mut b = [0u8; 2];
+            let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b);
+            self.p2p_port = 20000 + (u16::from_be_bytes(b) % 28000);
+            changed = true;
+        }
+        changed
     }
 }
 
@@ -88,6 +121,9 @@ pub struct Config {
     pub start_minimized: bool,
     /// Громкость участников по имени (1.0 = 100%).
     pub volumes: BTreeMap<String, f32>,
+    /// Последний внешний адрес, по которому удалось подключиться к серверу через P2P:
+    /// с него повторное подключение начинается сразу, без поиска в DHT.
+    pub p2p_last: String,
     /// Сервер на этом компьютере (нет секции — сервер ни разу не настраивался).
     pub host: Option<HostConfig>,
 
@@ -116,6 +152,7 @@ impl Default for Config {
             bitrate: 40_000,
             start_minimized: false,
             volumes: BTreeMap::new(),
+            p2p_last: String::new(),
             host: None,
             password: String::new(),
             path: PathBuf::new(),
@@ -177,6 +214,9 @@ impl Config {
         cfg.password = crate::win::unprotect(&cfg.password_enc);
         if let Some(h) = cfg.host.as_mut() {
             h.password = crate::win::unprotect(&h.password_enc);
+            h.room = crate::win::from_hex(&h.room_enc)
+                .and_then(|d| crate::win::unprotect_bytes(&d))
+                .and_then(|b| b.try_into().ok());
             if h.port == 0 {
                 h.port = DEFAULT_PORT;
             }
@@ -196,6 +236,11 @@ impl Config {
         self.password_enc = crate::win::protect(&self.password);
         if let Some(h) = self.host.as_mut() {
             h.password_enc = crate::win::protect(&h.password);
+            h.room_enc = h
+                .room
+                .and_then(|r| crate::win::protect_bytes(&r))
+                .map(|b| crate::win::to_hex(&b))
+                .unwrap_or_default();
         }
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -241,7 +286,8 @@ impl Config {
     }
 
     pub fn is_complete(&self) -> bool {
-        parse_address(&self.server).is_some() && !self.username.trim().is_empty()
+        (parse_address(&self.server).is_some() || crate::p2p::Invite::parse(&self.server).is_some())
+            && !self.username.trim().is_empty()
     }
 
     pub fn host(&self) -> HostConfig {

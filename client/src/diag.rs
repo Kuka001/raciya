@@ -67,6 +67,10 @@ pub struct Context {
     pub status: crate::core::Status,
     /// Проверку запросил пользователь: медленные проверки выполняются заново, без кэша.
     pub force: bool,
+    /// Клиент подключается по коду приглашения v2 (P2P).
+    pub uses_p2p: bool,
+    /// Состояние P2P своего сервера.
+    pub p2p_host: Option<crate::p2p::HostStatus>,
 }
 
 struct Adapter {
@@ -483,6 +487,8 @@ pub fn run(ctx: &Context) -> Report {
                 ));
             }
         }
+    } else if matches!(ctx.status, crate::core::Status::Reconnecting(_)) && ctx.uses_p2p {
+        p2p_client_checks(ctx, &mut rep);
     } else if matches!(ctx.status, crate::core::Status::Reconnecting(_)) && !local_server {
         if let Some(i) = reachability(&ctx.server_host, ctx.server_port) {
             rep.issues.push(i);
@@ -495,6 +501,40 @@ pub fn run(ctx: &Context) -> Report {
     }
 
     rep
+}
+
+/// Тип NAT по двум STUN-серверам (кэш на 30 минут): (внешний адрес, порт одинаковый).
+fn nat_type(force: bool) -> Option<(SocketAddr, Option<bool>)> {
+    static CACHE: Mutex<Option<(Instant, Option<(SocketAddr, Option<bool>)>)>> = Mutex::new(None);
+    let mut c = CACHE.lock().unwrap();
+    if let Some((at, v)) = c.as_ref() {
+        if !force && at.elapsed() < Duration::from_secs(1800) {
+            return *v;
+        }
+    }
+    let v = crate::p2p::nat_check().map(|(a, b)| (a, b.map(|b| b.port() == a.port())));
+    *c = Some((Instant::now(), v));
+    v
+}
+
+/// Клиент с кодом приглашения не может подключиться: смотрим, пропускает ли NAT прямые соединения.
+fn p2p_client_checks(ctx: &Context, rep: &mut Report) {
+    let zt_fix = if ctx.zt_network.is_empty() { Fix::None } else { Fix::JoinZeroTier };
+    match nat_type(ctx.force) {
+        None => rep.issues.push(issue(
+            Severity::Problem,
+            "UDP в интернет не проходит",
+            "Прямое соединение невозможно: UDP закрывает брандмауэр, антивирус или провайдер. Попробуйте другую сеть или запасной путь через ZeroTier.",
+            zt_fix,
+        )),
+        Some((addr, Some(false))) => rep.issues.push(issue(
+            Severity::Problem,
+            "Ваш NAT не даёт прямых соединений",
+            format!("Внешний адрес {} меняется для разных серверов (симметричный NAT — так бывает у мобильного интернета). Подключитесь через другую сеть или включите запасной путь ZeroTier.", addr.ip()),
+            zt_fix,
+        )),
+        Some((addr, _)) => rep.facts.push(format!("NAT: пробиваемый, {}", addr.ip())),
+    }
 }
 
 /// Почему не удаётся подключиться: сначала ping до компьютера, потом попытка открыть порт.
@@ -584,6 +624,27 @@ fn server_checks(ctx: &Context, rep: &mut Report) {
         return;
     }
     let port = ctx.host_port;
+    if let Some(p) = &ctx.p2p_host {
+        if p.attempted && p.announced == 0 {
+            rep.issues.push(issue(
+                Severity::Warning,
+                "Сервер не смог опубликовать адрес для интернета",
+                "Сеть DHT не ответила — UDP наружу закрыт или временно нет интернета. Друзья в локальной сети и через ZeroTier подключатся, по коду приглашения — пока нет. Программа повторит попытку сама.",
+                Fix::None,
+            ));
+        }
+        if p.stable_port == Some(false) {
+            rep.issues.push(issue(
+                Severity::Warning,
+                "NAT этого компьютера не даёт прямых соединений",
+                "Внешний порт меняется для разных адресатов (симметричный NAT). Друзьям через интернет понадобится запасной путь ZeroTier.",
+                Fix::None,
+            ));
+        }
+        if let Some(a) = p.external {
+            rep.facts.push(format!("Сервер в интернете: {}", a.ip()));
+        }
+    }
     // Правила сети ZeroTier (если сеть создана на этом компьютере) должны пропускать порт сервера.
     if !ctx.zt_network.is_empty() {
         if let Some(net) = crate::zt::get(&format!("/controller/network/{}", ctx.zt_network)) {
